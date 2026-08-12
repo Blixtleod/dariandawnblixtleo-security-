@@ -301,6 +301,69 @@ AWF uses a forward proxy (Squid) for HTTPS egress control rather than transparen
 - **Java tools**: Use `JAVA_TOOL_OPTIONS` with JVM system properties (set automatically by AWF)
 - **Maven**: Requires `~/.m2/settings.xml` (must be configured manually — see above)
 
+## Harness Binary Resolution Issues
+
+### `spawn /usr/local/bin/<tool> ENOENT` (hardcoded absolute paths)
+
+**Problem:** An agentic harness (e.g. the gh-aw Copilot engine) fails with an error like:
+
+```
+spawn /usr/local/bin/copilot ENOENT
+```
+
+even though the tool is installed and resolvable via `PATH` on the runner.
+
+**Cause:** Some harnesses hardcode an absolute path to the tool binary (e.g.
+`/usr/local/bin/copilot`) instead of doing a `PATH` lookup, and their
+installer/cache-hit logic can skip creating that file (e.g. a tool-cache hit
+short-circuits before the `/usr/local/bin` wrapper is installed). This is a
+bug in the harness/installer, not in AWF — but it interacts with how AWF's
+agent container mounts the host filesystem:
+
+- AWF's agent container mounts host `/usr` (and therefore `/usr/local`)
+  **read-only** at `/host/usr` (chroot mode) so it can't be written to from
+  *inside* the container.
+- The bind mount is a live view of host `/usr/local/bin`: changes made on the
+  **host** (including host-side `pre-agent-steps`) are visible in the sandbox.
+- Commands that run *inside* the AWF sandbox still cannot create this symlink,
+  because `/usr` is mounted read-only there.
+
+**Automatic mitigation (Copilot CLI):** For Copilot runs, AWF's agent
+entrypoint now checks `/usr/local/bin/copilot` at container start. When the
+entry is missing, it resolves `copilot` through the chroot `PATH` and the
+`$GITHUB_PATH` entries (which is where a warm Copilot CLI tool-cache is
+activated) and creates the expected symlink before the command runs. Because
+host `/usr` is read-only, AWF stages the symlink in a root-owned directory and
+bind-mounts it over the chroot's `/usr/local/bin`, preserving every existing
+entry; the host filesystem is never modified. The behavior is driven by the
+internal `AWF_ENSURE_USR_LOCAL_BIN` environment variable (comma-separated
+binary names) and is a no-op when the path already exists.
+
+**Workarounds (other tools):**
+
+1. **Host-side symlink before invoking `awf`** — if you control the step
+   immediately before AWF starts the sandbox, create the missing binary on
+   the *host* filesystem so it is present when AWF takes its `/usr` bind
+   mount:
+   ```bash
+   sudo ln -sf "$(command -v copilot)" /usr/local/bin/copilot
+   sudo awf --allow-domains ... -- <command>
+   ```
+   Doing this from *inside* the sandboxed command will not work, since
+   `/usr/local` is read-only once the container is running.
+2. **`chroot.binariesSourcePath`** — point this config option at a host
+   directory containing the tool binary (or a symlink to it). AWF mounts it
+   read-only at `/host/tmp/awf-runner-bin` and `entrypoint.sh` prepends it to
+   the chrooted `PATH`. This fixes `PATH`-based lookups, but does **not**
+   help harnesses that spawn a hardcoded absolute path (like
+   `/usr/local/bin/copilot`) rather than resolving the binary via `PATH`. See
+   [docs/awf-config-spec.md](awf-config-spec.md) §`chroot.binariesSourcePath`.
+3. **Fix upstream** — the durable fix is in the harness/installer itself
+   (e.g. gh-aw's `install_copilot_cli.sh` / `pkg/constants/constants.go`), so
+   that it always resolves the binary via `PATH` or always populates the
+   hardcoded path, even on a tool-cache hit. Track/coordinate with the
+   upstream project for the permanent fix.
+
 ## Log Analysis
 
 ### Finding Blocked Domains

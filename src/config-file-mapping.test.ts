@@ -158,6 +158,13 @@ describe('mapAwfFileConfigToCliOptions', () => {
       apiProxy: {
         maxEffectiveTokens: 6000,
         maxAiCredits: 1.2,
+        providers: {
+          anthropic: {
+            models: {
+              'custom-model': { cost: { input: '3e-06', output: '1.5e-05' } },
+            },
+          },
+        },
         modelMultipliers: {
           'gpt-4o': 2,
           'claude-sonnet-4': 1.5,
@@ -168,6 +175,13 @@ describe('mapAwfFileConfigToCliOptions', () => {
     });
     expect(result.maxEffectiveTokens).toBe(6000);
     expect(result.maxAiCredits).toBe(1.2);
+    expect(result.apiProxyProviders).toEqual({
+      anthropic: {
+        models: {
+          'custom-model': { cost: { input: '3e-06', output: '1.5e-05' } },
+        },
+      },
+    });
     expect(result.effectiveTokenModelMultipliers).toEqual({
       'gpt-4o': 2,
       'claude-sonnet-4': 1.5,
@@ -307,6 +321,7 @@ describe('mapAwfFileConfigToCliOptions', () => {
     const result = mapAwfFileConfigToCliOptions({
       container: {
         memoryLimit: '4g',
+        pidsLimit: 2000,
         enableDind: true,
         workDir: '/tmp/awf',
         imageRegistry: 'ghcr.io/custom',
@@ -322,6 +337,7 @@ describe('mapAwfFileConfigToCliOptions', () => {
     });
 
     expect(result.memoryLimit).toBe('4g');
+    expect(result.pidsLimit).toBe('2000');
     expect(result.enableDind).toBe(true);
     expect(result.workDir).toBe('/tmp/awf');
     expect(result.imageRegistry).toBe('ghcr.io/custom');
@@ -569,5 +585,14 @@ describe('mapAwfFileConfigToCliOptions', () => {
   it('leaves runnerTopology undefined when runner is not set', () => {
     const result = mapAwfFileConfigToCliOptions({});
     expect(result.runnerTopology).toBeUndefined();
+  });
+
+  it('passes unified enclaves through as trusted config-only state', () => {
+    const enclaves = {
+      enabled: true,
+      privateRepos: [{ repo: 'octo/private', sensitivity: 'internal' as const }],
+      executors: { script: { enabled: true } },
+    };
+    expect(mapAwfFileConfigToCliOptions({ enclaves }).enclaves).toEqual(enclaves);
   });
 });

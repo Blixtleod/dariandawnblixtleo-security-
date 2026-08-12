@@ -3,6 +3,7 @@ const {
     resolveCopilotAuthToken,
     resolveApiKey,
     stripBearerPrefix,
+    classifyGithubServerHost,
     isGhesInstance,
     copilotTargetRequiresGitHubTokenPrefix,
   },
@@ -227,6 +228,28 @@ describe('isGhesInstance', () => {
   });
 });
 
+describe('classifyGithubServerHost', () => {
+  it('classifies github.com as github', () => {
+    expect(classifyGithubServerHost({ GITHUB_SERVER_URL: 'https://github.com' })).toEqual({ kind: 'github' });
+  });
+
+  it('classifies *.ghe.com hosts as ghec and returns the tenant subdomain', () => {
+    expect(classifyGithubServerHost({ GITHUB_SERVER_URL: 'https://myorg.ghe.com' })).toEqual({
+      kind: 'ghec',
+      subdomain: 'myorg',
+    });
+  });
+
+  it('classifies non-ghe.com enterprise hosts as ghes', () => {
+    expect(classifyGithubServerHost({ GITHUB_SERVER_URL: 'https://ghes.mycompany.com' })).toEqual({ kind: 'ghes' });
+  });
+
+  it('classifies invalid or missing values safely', () => {
+    expect(classifyGithubServerHost({ GITHUB_SERVER_URL: 'not-a-url' })).toEqual({ kind: 'invalid' });
+    expect(classifyGithubServerHost({})).toEqual({ kind: 'missing' });
+  });
+});
+
 describe('copilotTargetRequiresGitHubTokenPrefix', () => {
   it('returns true for the Enterprise Copilot endpoint', () => {
     expect(copilotTargetRequiresGitHubTokenPrefix('api.enterprise.githubcopilot.com', {})).toBe(true);
@@ -286,10 +309,24 @@ describe('copilotTargetRequiresGitHubTokenPrefix', () => {
     expect(copilotTargetRequiresGitHubTokenPrefix('api.githubcopilot.com', {})).toBe(false);
   });
 
-  it('returns false for a *.ghe.com (GHEC) Copilot target', () => {
+  it('returns true for a GHEC data-residency Copilot target', () => {
     expect(copilotTargetRequiresGitHubTokenPrefix('copilot-api.myorg.ghe.com', {
       GITHUB_SERVER_URL: 'https://myorg.ghe.com',
-    })).toBe(false);
+    })).toBe(true);
+  });
+
+  it('returns true for a GHEC data-residency Copilot target with AWF_PLATFORM_TYPE=ghec', () => {
+    expect(copilotTargetRequiresGitHubTokenPrefix('copilot-api.myorg.ghe.com', {
+      AWF_PLATFORM_TYPE: 'ghec',
+      GITHUB_SERVER_URL: 'https://myorg.ghe.com',
+    })).toBe(true);
+  });
+
+  it('returns false for malformed or non-canonical GHEC data-residency target shapes', () => {
+    const env = { GITHUB_SERVER_URL: 'https://myorg.ghe.com' };
+    expect(copilotTargetRequiresGitHubTokenPrefix('copilot-api..ghe.com', env)).toBe(false);
+    expect(copilotTargetRequiresGitHubTokenPrefix('copilot-api.a.b.ghe.com', env)).toBe(false);
+    expect(copilotTargetRequiresGitHubTokenPrefix('copilot-api.myorg.ghe.com.evil.com', env)).toBe(false);
   });
 
   it('returns false when no token-prefix indicators are present', () => {

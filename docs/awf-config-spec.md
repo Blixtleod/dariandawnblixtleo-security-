@@ -75,6 +75,8 @@ following top-level properties. All are OPTIONAL:
 | `apiProxy` | object | API proxy sidecar configuration |
 | `security` | object | Security and isolation settings |
 | `container` | object | Container and Docker settings |
+| `firecracker` | object | Firecracker v1.16.1 control-plane preview settings |
+| `cloudHypervisor` | object | Cloud Hypervisor v53.0 microVM preview settings (see §4.1) |
 | `chroot` | object | Chroot execution overrides for split-filesystem ARC/DinD runners |
 | `dind` | object | Bootstrap helpers for ARC/DinD split runner/daemon filesystems |
 | `runner` | object | Runner topology declaration (standard vs. ARC/DinD) |
@@ -82,9 +84,43 @@ following top-level properties. All are OPTIONAL:
 | `logging` | object | Logging and diagnostics |
 | `rateLimiting` | object | Egress rate limiting |
 | `platform` | object | GitHub platform deployment type declaration |
+| `enclaves` | object | Unified private-repository enclave subsystem (see §14) |
 
 Property-level constraints, types, and descriptions are defined
 normatively by `docs/awf-config.schema.json`.
+
+### 4.1 Cloud Hypervisor microVM preview
+
+The `cloudHypervisor` surface pins Cloud Hypervisor v53.0 artifacts and
+digests (binary, PCI-capable guest kernel, rootfs, and the shared AWF guest
+supervisor) and, like Firecracker, requires explicit
+`--cloud-hypervisor-preview` opt-in plus `container.containerRuntime:
+"cloud-hypervisor"` to execute a workload. Supported host target is
+GitHub-hosted Ubuntu `x86_64` runners with KVM only — self-hosted and
+non-Ubuntu/non-x86_64 hosts are rejected explicitly by
+[`src/cloud-hypervisor/host-eligibility.ts`](../src/cloud-hypervisor/host-eligibility.ts),
+unlike Firecracker's preview which permits self-hosted hosts. See
+[`src/cloud-hypervisor/preflight.ts`](../src/cloud-hypervisor/preflight.ts)
+for the artifact/host trust-check module,
+[`src/cloud-hypervisor/launcher.ts`](../src/cloud-hypervisor/launcher.ts)
+for the secure host launcher (network-namespace join, privilege drop, and
+Landlock-based filesystem confinement in place of Firecracker's jailer),
+[`src/cloud-hypervisor/manager.ts`](../src/cloud-hypervisor/manager.ts) for
+the VM lifecycle, and [`guest/cloud-hypervisor/`](../guest/cloud-hypervisor/)
+for the guest artifact build/verification pipeline. See
+[docs/cloud-hypervisor-foundation.md](./cloud-hypervisor-foundation.md) for
+the full architecture and security-boundary writeup.
+
+Release test artifacts (`cloud-hypervisor-test-x86_64`) are x86_64
+test/preview artifacts built and verified by both the release workflow and
+[`test-cloud-hypervisor.yml`](../.github/workflows/test-cloud-hypervisor.yml),
+which also runs the live-KVM parity/security smoke suite
+(`scripts/ci/cloud-hypervisor-live-smoke.sh`) on GitHub-hosted Ubuntu x86_64
+runners when triggered by manual dispatch or the `cloud-hypervisor-kvm` pull
+request label. They are published as explicitly named release/workflow
+assets, but are not production defaults and are never auto-downloaded. See
+[docs/cloud-hypervisor-foundation.md](./cloud-hypervisor-foundation.md#part-14--ci-workflow)
+for the complete CI workflow specification and troubleshooting reference.
 
 ## 5. CLI Mapping
 
@@ -105,12 +141,13 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `network.isolation` → `--network-isolation` *(experimental; enforces egress via Docker network topology instead of host iptables)*
 - `network.topologyAttach[]` → `--topology-attach <name>` *(repeatable; requires `network.isolation: true`)*
 - `apiProxy.enabled` → `--enable-api-proxy` *([DEPRECATED] API proxy is always enabled; this flag is ignored)*
-- `apiProxy.enableTokenSteering` → `--enable-token-steering`
+- `apiProxy.enableTokenSteering` → `--enable-token-steering` *(maps to `AWF_ENABLE_TOKEN_STEERING`; omit or set to `false` to opt out)*
 - `apiProxy.anthropicAutoCache` → `--anthropic-auto-cache`
 - `apiProxy.anthropicCacheTailTtl` → `--anthropic-cache-tail-ttl <5m|1h>`
 - `apiProxy.maxEffectiveTokens` → *(config-only; no CLI equivalent)*
 - `apiProxy.maxAiCredits` → *(config-only; maps to `AWF_MAX_AI_CREDITS`)*
 - `apiProxy.defaultAiCreditsPricing` → *(config-only; maps to `AWF_DEFAULT_AI_CREDITS_PRICING`)*
+- `apiProxy.providers` → *(config-only; maps to `AWF_API_PROXY_PROVIDERS`)*
 - `apiProxy.modelMultipliers` → `--max-model-multiplier <model:multiplier,...>`
 - `apiProxy.defaultModelMultiplier` → *(config-only; maps to `AWF_EFFECTIVE_TOKEN_DEFAULT_MODEL_MULTIPLIER`)*
 - `apiProxy.maxTurns` → *(config-only; no CLI equivalent)*
@@ -171,6 +208,7 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `security.difcProxy.host` → `--difc-proxy-host`
 - `security.difcProxy.caCert` → `--difc-proxy-ca-cert`
 - `container.memoryLimit` → `--memory-limit`
+- `container.pidsLimit` → `--pids-limit`
 - `container.agentTimeout` → `--agent-timeout`
 - `container.enableDind` → `--enable-dind`
 - `container.workDir` → `--work-dir`
@@ -185,8 +223,34 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `container.dockerHostPathPrefix` → `--docker-host-path-prefix`
 - `container.runnerToolCachePath` → *(config-only; checked first for optional read-only runner tool cache mount, before `RUNNER_TOOL_CACHE` and `/home/runner/work/_tool` auto-detection)*
 - `container.mounts[]` → `-v, --mount` *(repeatable; each array entry maps to one Docker volume mount in `/host_path:/container_path[:ro|rw]` format (both paths must be absolute; host path must exist); in chroot mode, container paths are automatically prefixed with `/host`)*
-- `container.containerRuntime` → `--container-runtime` *(user-facing runtime name: `"gvisor"` for OCI runtime in compose, `"sbx"` for Docker sbx microVM. For gvisor: translates to `"runsc"`, injects `extra_hosts` for DNS workaround. For sbx: agent runs in a hypervisor-isolated microVM, infra stays in compose, sbx proxy chains through AWF's Squid.)*
-- `chroot.binariesSourcePath` → *(config-only; overlays a runner-side binaries directory at `/usr/local/bin` inside chroot mode)*
+- `container.containerRuntime` → `--container-runtime` *(user-facing runtime name: `"gvisor"` for OCI runtime in compose, `"sbx"` for Docker sbx microVM, `"firecracker"` for the explicit Firecracker v1.16.1 workload preview, or `"cloud-hypervisor"` for the explicit Cloud Hypervisor v53.0 workload preview (GitHub-hosted Ubuntu x86_64 KVM runners only; see §4.1). For gvisor: translates to `"runsc"`, injects `extra_hosts` for DNS workaround. For sbx, Firecracker, and Cloud Hypervisor: infrastructure stays in Compose while the primary agent runs in a microVM.)*
+- `firecracker.previewEnabled` → `--firecracker-preview`
+- `firecracker.firecrackerBinary` → `--firecracker-binary`
+- `firecracker.jailerBinary` → `--firecracker-jailer-binary`
+- `firecracker.kernelPath` → `--firecracker-kernel`
+- `firecracker.rootfsPath` → `--firecracker-rootfs`
+- `firecracker.supervisorPath` → `--firecracker-supervisor`
+- `firecracker.vcpuCount` → `--firecracker-vcpus`
+- `firecracker.memoryMib` → `--firecracker-memory-mib`
+- `firecracker.apiTimeoutMs` → `--firecracker-api-timeout-ms`
+- `firecracker.sha256.firecracker` → `--firecracker-binary-sha256`
+- `firecracker.sha256.jailer` → `--firecracker-jailer-sha256`
+- `firecracker.sha256.kernel` → `--firecracker-kernel-sha256`
+- `firecracker.sha256.rootfs` → `--firecracker-rootfs-sha256`
+- `firecracker.sha256.supervisor` → `--firecracker-supervisor-sha256`
+- `cloudHypervisor.previewEnabled` → `--cloud-hypervisor-preview` *(requires `container.containerRuntime: "cloud-hypervisor"` and a GitHub-hosted Ubuntu x86_64 KVM runner to execute a workload)*
+- `cloudHypervisor.cloudHypervisorBinary` → `--cloud-hypervisor-binary`
+- `cloudHypervisor.kernelPath` → `--cloud-hypervisor-kernel`
+- `cloudHypervisor.rootfsPath` → `--cloud-hypervisor-rootfs`
+- `cloudHypervisor.supervisorPath` → `--cloud-hypervisor-supervisor`
+- `cloudHypervisor.vcpuCount` → `--cloud-hypervisor-vcpus`
+- `cloudHypervisor.memoryMib` → `--cloud-hypervisor-memory-mib`
+- `cloudHypervisor.apiTimeoutMs` → `--cloud-hypervisor-api-timeout-ms`
+- `cloudHypervisor.sha256.cloudHypervisor` → `--cloud-hypervisor-binary-sha256`
+- `cloudHypervisor.sha256.kernel` → `--cloud-hypervisor-kernel-sha256`
+- `cloudHypervisor.sha256.rootfs` → `--cloud-hypervisor-rootfs-sha256`
+- `cloudHypervisor.sha256.supervisor` → `--cloud-hypervisor-supervisor-sha256`
+- `chroot.binariesSourcePath` → *(config-only; mounts a runner-side binaries directory at `/tmp/awf-runner-bin` inside chroot mode and prepends it to `PATH`)*
 - `chroot.identity.home` → *(config-only; forwarded as `AWF_CHROOT_IDENTITY_HOME` and applied after chroot pivot)*
 - `chroot.identity.user` → *(config-only; forwarded as `AWF_CHROOT_IDENTITY_USER` and applied to `USER`/`LOGNAME` after chroot pivot)*
 - `chroot.identity.uid` → *(config-only; forwarded as `AWF_CHROOT_IDENTITY_UID` for chroot user mapping)*
@@ -208,13 +272,76 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `rateLimiting.requestsPerMinute` → `--rate-limit-rpm`
 - `rateLimiting.requestsPerHour` → `--rate-limit-rph`
 - `rateLimiting.bytesPerMinute` → `--rate-limit-bytes-pm`
+- *(no config equivalent)* → `--reflect` *(CLI-only; starts AWF, queries the API proxy `/reflect` endpoint, and prints its JSON response instead of running a command; mutually exclusive with a command argument)*
 - `platform.type` → *(config-only; maps to `AWF_PLATFORM_TYPE`)*
 - `runner.topology` → *(config-only; sets runner deployment model — `standard` or `arc-dind`; when `arc-dind`, enables sysroot staging and emits RUNNER_TOOL_CACHE warnings)*
 - `runner.sysrootImage` → *(config-only; sysroot init-container image for `arc-dind` topology; defaults to `<container.imageRegistry>/build-tools:<container.imageTag>`, where `container.imageRegistry` defaults to `ghcr.io/github/gh-aw-firewall`)*
+- `enclaves.enabled` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.privateRepos[]` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.enabled` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.runtime` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.image` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.network` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.interpreter` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.timeout` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.memoryLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.cpuLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.pidsLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.tmpfsLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.maxOutputBytes` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.maxScriptBytes` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.script.maxInvocations` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.enabled` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.runtime` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.image` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.network` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.engine` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.profile` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.model` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.timeout` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.memoryLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.cpuLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.pidsLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.tmpfsLimit` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.maxOutputBytes` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.maxTaskBytes` → *(config-only; no CLI equivalent, see §14)*
+- `enclaves.executors.agent.maxInvocations` → *(config-only; no CLI equivalent, see §14)*
 
 When `container.dockerHostPathPrefix` points at a daemon-visible shared `/tmp` path, the implementation stages the invoking CLI binary together with `/etc/passwd`, `/etc/group`, and the generated chroot `/etc/hosts` under that shared path so chroot mode can bootstrap on split-filesystem ARC/DinD hosts.
 
+The `firecracker` surface is an explicit workload preview pinned to Firecracker
+v1.16.1 on Linux/KVM (`x86_64` or `aarch64`). It requires strict network
+isolation, a local Unix-socket Docker daemon, the matching jailer, and explicit
+SHA-256 digests for Firecracker, jailer, kernel, rootfs, and the AWF guest
+supervisor. AWF starts Compose infrastructure only, attaches the jailed
+microVM to the proven internal bridge, and executes through vsock. Host access,
+DinD, extra mounts, TTY, topology peers, and enclaves fail closed in this
+preview. Selecting `firecracker` never falls back to another runtime.
+
+**macOS and Windows are permanently unsupported.** CI specifically supports
+GitHub-hosted x64 `ubuntu-24.04`; KVM remains mandatory, and hosts without usable
+`/dev/kvm` access fail closed. The API proxy is mandatory; provider credentials
+are never passed as guest environment variables. No auto-download of artifacts;
+all five artifact paths and their SHA-256 digests are required on every invocation.
+Release test artifacts (`firecracker-test-x86_64`) are x86_64 test/preview
+artifacts built by both the release workflow and `test-firecracker.yml`. They
+are published as explicitly named release/workflow assets, but are not
+production defaults and are never auto-downloaded. See
+[Firecracker integration (preview)](./firecracker-integration.md) for the
+complete operator guide, trust model, workspace semantics, CI workflow
+specification, and troubleshooting reference.
+
 When DinD is detected, AWF preserves the detected `DOCKER_HOST` value for the agent environment (including MCP servers) so DinD-aware tooling can reach the correct daemon without manual workflow env overrides.
+
+`security.allowHostPorts` (`--allow-host-ports`) is accepted together with
+`security.enableHostAccess` (`--enable-host-access`) in strict security mode
+(the default, without `--legacy-security`), but it does not provide a direct
+route to raw-protocol GitHub Actions `services:` containers. Strict topology
+intentionally omits the agent's `host.docker.internal` mapping and host-access
+iptables bypass; use legacy security or a separately verified tunnel for direct
+service clients.
+`security.allowHostServicePorts` (`--allow-host-service-ports`), which relies
+on host iptables, remains suppressed in strict mode.
 
 The following CLI flag has no config-file equivalent by design:
 
@@ -289,8 +416,8 @@ passthrough. A conforming implementation MUST NOT inherit them from the host:
 |----------|-----------|
 | System | `PATH`, `PWD`, `OLDPWD`, `SHLVL`, `_`, `SUDO_COMMAND`, `SUDO_USER`, `SUDO_UID`, `SUDO_GID` |
 | Proxy | `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`, `FTP_PROXY`, `ftp_proxy` |
-| Actions artifact tokens | `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RESULTS_URL` |
-| AWF internal controls | `AWF_PREFLIGHT_BINARY`, `AWF_GEMINI_ENABLED` |
+| Actions runtime credentials | `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RESULTS_URL`, `ACTIONS_ID_TOKEN_REQUEST_URL`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` |
+| AWF internal controls | `AWF_PREFLIGHT_BINARY`, `AWF_ENSURE_USR_LOCAL_BIN`, `AWF_GEMINI_ENABLED` |
 
 > **Note:** Host proxy variables are read for upstream proxy auto-detection
 > (see `--upstream-proxy`) but MUST NOT propagate into the agent container.
@@ -305,12 +432,15 @@ the following host variables into the agent container:
 |----------|-----------|
 | GitHub authentication | `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN` |
 | GitHub enterprise | `GITHUB_SERVER_URL`, `GITHUB_API_URL` |
-| Actions OIDC | `ACTIONS_ID_TOKEN_REQUEST_URL`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` |
 | Docker client | `DOCKER_HOST`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, `DOCKER_CONFIG`, `DOCKER_CONTEXT`, `DOCKER_API_VERSION`, `DOCKER_DEFAULT_PLATFORM` |
 | User environment | `USER`, `XDG_CONFIG_HOME` |
 
 When `--env-all` IS active, all host variables not in the excluded set
 (§8.3) SHALL be forwarded, subject to credential isolation rules (§9).
+
+Actions OIDC request variables MUST be forwarded directly to the api-proxy
+sidecar when `apiProxy.auth.type` is `github-oidc` and MUST NOT be forwarded
+to the agent through any environment input path.
 
 ### 8.5 Explicit Overrides
 
@@ -438,12 +568,14 @@ The default protected token list is:
 ```
 COPILOT_GITHUB_TOKEN, GITHUB_TOKEN, GH_TOKEN, GITHUB_API_TOKEN,
 GITHUB_PAT, GH_ACCESS_TOKEN, OPENAI_API_KEY, OPENAI_KEY,
-ANTHROPIC_API_KEY, CLAUDE_API_KEY, CODEX_API_KEY,
-COPILOT_PROVIDER_API_KEY
+ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLAUDE_API_KEY,
+CODEX_API_KEY, COPILOT_PROVIDER_API_KEY
 ```
 
-Placeholder compatibility values (§9.2 item 3) are not secrets and MUST
-NOT be subject to one-shot protection.
+Placeholder compatibility values (§9.2 item 3) are not secrets. However,
+provider credential variable names such as `ANTHROPIC_AUTH_TOKEN` MAY remain
+on the protection list as defense-in-depth so unexpectedly forwarded real
+credentials are still scrubbed on first read.
 
 ### 9.5 OIDC Authentication
 
@@ -672,8 +804,11 @@ Each threshold MUST be recorded at most once per run.
 ### 10.5 Token Steering
 
 Token steering is **opt-in**. It is active only when `apiProxy.enableTokenSteering`
-is `true` (CLI: `--enable-token-steering`). When disabled (the default), thresholds
-are still tracked (for introspection) but no warning messages are injected.
+is `true` (CLI: `--enable-token-steering`), which sets `AWF_ENABLE_TOKEN_STEERING=true`
+in the api-proxy sidecar. When disabled (the default), thresholds are still tracked
+(for introspection) but no warning messages are injected. Setting the field to
+`false`, or omitting it, opts a workflow out; the env var is only emitted when the
+value is `true`.
 
 When token steering is enabled and a threshold is first crossed, the proxy MUST
 inject a budget-warning system message into the **body** of the very next eligible
@@ -751,10 +886,14 @@ Setting `maxAiCredits` above 10,000 MUST NOT raise the effective limit.
 
 ### 10.7.1 Model Name Resolution for Pricing
 
-The AI credits guard resolves model names using a two-step lookup:
+The AI credits guard resolves model names using this lookup order:
 
-1. **Curated pricing table** — a built-in table of known models with exact pricing.
-2. **Bundled models.dev catalog** — a bundled snapshot of the models.dev catalog used as a fallback when the model is not found in the curated table.
+1. **Operator provider overlay** — model prices configured under
+   `apiProxy.providers`.
+2. **Runtime provider metadata** — authoritative token prices discovered from
+   the configured provider. Copilot supports this today.
+3. **Curated pricing table** — a built-in table of known models with exact pricing.
+4. **Bundled models.dev catalog** — a bundled snapshot of the models.dev catalog used as a fallback when the model is not found in the curated table.
 
 Model names are **canonicalized** before lookup: provider prefixes
 (e.g. `copilot/`) are stripped, and separators (`.`, `_`, `-`) are treated
@@ -762,10 +901,39 @@ as interchangeable. For example, `copilot/claude-sonnet-4.6`,
 `claude_sonnet_4_6`, and `claude-sonnet-4-6` all resolve to the same pricing
 entry.
 
-If neither source resolves the model, the `defaultAiCreditsPricing` fallback
+If none of these sources resolves the model, the `defaultAiCreditsPricing` fallback
 (if configured) is used. If that is also absent, the request is rejected.
 Models whose catalog entry carries zero-cost pricing are recognized as known
 models with zero AI credit impact, so they are never rejected as "unknown".
+
+Runtime tiered pricing uses the provider's default-tier prompt threshold. When
+the total input exceeds that threshold, all token categories use the
+long-context tier. Pricing source, API version, observation time, selected
+tier, and any provider-advertised promotion are retained in provenance.
+Promotions are informational only because provider discovery does not prove
+that a discount applies to a specific request; they never reduce accounting.
+Failed or empty discovery responses do not replace the last successful runtime
+snapshot.
+
+Provider overlays use the models.dev provider structure and per-token dollar
+rates:
+
+```yaml
+apiProxy:
+  providers:
+    github-copilot:
+      models:
+        custom-model:
+          cost:
+            input: "3e-06"
+            output: "1.5e-05"
+            cache_read: "3e-07"
+            cache_write: "3.75e-06"
+```
+
+The overlay is passed to both normal and threat-detection API proxy instances
+through `AWF_API_PROXY_PROVIDERS`. Provider aliases `github-copilot` and
+`copilot` resolve to the Copilot proxy.
 
 ### 10.7.2 Default AI Credits Pricing (Fallback)
 
@@ -1283,6 +1451,31 @@ This enables workflow authors to get clear, early feedback when a retired or
 misspelled model is specified, rather than waiting for the first API request to
 fail with an opaque error.
 
+### 12.1 Alias Candidates Are Restricted to Configured Providers
+
+Alias resolution MUST only consider provider slots that are actually configured
+for the run. Before an alias is expanded (and before aliases are advertised via
+`/reflect` and `models.json`), the cached model lists of providers that report
+`configured: false` are treated as empty. A provider-scoped pattern such as
+`copilot/*sonnet*` therefore yields no candidate when no Copilot credential is
+present, even if a model list was cached earlier in the run.
+
+Configuration is determined from each provider's reflected `configured` slot,
+not from request readiness. A configured OIDC provider remains eligible while
+its token is being minted. When configured providers have no model catalogue
+yet, aliases scoped only to unconfigured providers are still omitted, while
+aliases that can target a configured provider remain advertised until model
+data is available.
+
+Without this filter, a Copilot-first alias group would steer every request to a
+slot that answers `provider_not_configured`, producing a 100% call-failure rate
+and, for retry-happy clients, a non-terminating retry loop.
+
+A `provider_not_configured` response is a terminal run-level misconfiguration:
+it is returned with HTTP `403` and `"retryable": false` so clients fail fast.
+Only transient OIDC readiness states, such as a token that has not been minted
+yet, use HTTP `503` and `"retryable": true`.
+
 ## 13. Model Alias Logging
 
 The API proxy emits structured logging events during model alias resolution.
@@ -1491,6 +1684,92 @@ Each record follows the `blocked-request-diag/v<version>` schema:
   Use only for private runs and rotate or delete the artifact promptly.
 - The file is written to `AWF_TOKEN_LOG_DIR` alongside `token-usage.jsonl`
   and is governed by the same artifact-retention policy.
+
+## 14. Unified Enclaves
+
+The optional `enclaves` object defines AWF's sole supported private-repository execution surface. AWF stages immutable repository seeds on the host, starts one AWF-owned `enclave-mcp-server`, maintains one shared per-repository ledger for the run, and exposes enabled executors only through compiler-launched `gh-aw-mcpg`.
+
+### 14.1 Executors and shared configuration
+
+`enclaves.privateRepos` is the only trusted repository list. Every enabled executor shares it, and every admitted invocation debits the same live per-repository information budget.
+
+- **Script executor** — configured under `enclaves.executors.script`; launches a no-network, read-only, single-use Python sandbox.
+- **Agent executor** — configured under `enclaves.executors.agent`; launches a bounded single-use Copilot enclave whose only network peer is the dedicated API proxy.
+
+At least one executor MUST be enabled when `enclaves.enabled` is `true`. `gvisor` requires an exactly registered `runsc` runtime and never falls back. `sbx` remains fail-closed for both executors until the audited capability proof lands.
+
+The agent executor additionally requires `enableApiProxy`, a configured provider route for its fixed engine/profile, a configured `model`, and the absence of `enableDind`. AWF validates those requirements before repository staging.
+
+### 14.2 MCP-only tool surface
+
+The primary agent reaches private-repository execution only through these MCP tools:
+
+```text
+enclave_run_script({
+  privateRepo: "owner/repo",
+  schema: <finite disclosure schema>,
+  script: <bounded UTF-8 Python source>
+})
+
+enclave_run_agent({
+  privateRepo: "owner/repo",
+  schema: <finite disclosure schema>,
+  prompt: <bounded UTF-8 task prompt>
+})
+```
+
+Both tool schemas are closed (`additionalProperties: false`). A call can never provide or override images, runtimes, models, engines, profiles, mounts, network settings, credentials, repository catalogs, budgets, timeouts, or any other trusted control.
+
+The primary agent MUST NOT receive a broker socket, wrapper binary, direct server URL, capability token, repository seed, ledger state, or alternate enclave transport.
+
+### 14.3 Topology, gateway contract, and readiness
+
+`enclave-mcp-server` joins only the private `awf-enclave-mcp-control` network. The compiler launches `gh-aw-mcpg`, labels it for the run, and passes AWF the private gateway endpoint plus a run-unique capability/identity handoff. The server is reachable **only** through that gateway.
+
+When the agent executor is enabled, each invocation joins only the dedicated `internal` `awf-enclave-agent` network. Its sole reachable peer is the dedicated enclave API proxy. Squid, the primary agent, the general API proxy, safe outputs, the MCP gateway, and the MCP server itself are excluded from that network.
+
+The rollout contract depends on both upstream projects:
+
+1. `github/gh-aw#50920` — compiler support for the enclave upstream, capability handoff, identity label, endpoint propagation, and timeout handoff.
+2. `github/gh-aw-mcpg#10784` — late backend rediscovery so an initially unavailable HTTP backend can appear after gateway startup.
+3. MCP Gateway spec **1.15.0** and the **first mcpg release after v0.4.8 containing it**.
+
+While the backend is still starting, mcpg may return retryable HTTP `503 backend_unavailable`. AWF retries `initialize` with bounded backoff until `AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS` expires, then fails closed before the primary agent starts.
+
+### 14.4 Shared ledger and disclosure
+
+Script and agent calls debit the same live per-repository balance and share one AWF-owned admission lane. Switching executor kinds never resets or forks the ledger.
+
+`enclave_run_agent` necessarily sends repository-derived content to the configured model provider through the dedicated API proxy. The ledger bounds what the **calling agent** learns; it does not bound what the **provider** sees.
+
+### 14.5 Migration and removed surfaces
+
+The legacy private-repository surfaces are **removed, not deprecated**:
+
+| Removed surface | Replacement |
+| --- | --- |
+| `boundedQueries` | `enclaves.privateRepos` + `enclaves.executors.script` |
+| `boundedAgents` | `enclaves.privateRepos` + `enclaves.executors.agent` |
+| `bounded-query` wrapper / generated skill | `enclave_run_script` |
+| `bounded-agent` wrapper / generated skill | `enclave_run_agent` |
+| Separate legacy ledgers | One shared ledger inside `enclave-mcp-server` |
+| Direct legacy runtime handoffs | Compiler-launched `gh-aw-mcpg` handoff only |
+
+Configuration authors MUST remove the old keys instead of carrying a mixed legacy/unified document.
+
+### 14.6 Validation coverage
+
+Legacy bounded smoke and runtime-matrix workflow assets have been removed from the owned surface. Until a unified gh-aw enclave smoke workflow exists, local coverage remains unit-focused:
+
+- `src/services/enclave-mcp-service.test.ts`
+- `src/services/enclave-agent-service.test.ts`
+- `src/enclave/script-runner-spec.test.ts`
+- `src/enclave/agent-runner-spec.test.ts`
+- `src/enclave/manager.test.ts`
+- `src/enclave/mcp-server.test.ts`
+- `src/enclave/agent-mcp-server.test.ts`
+
+See [Unified Enclave Architecture and Migration](enclaves-architecture.md) for the operator-facing summary.
 
 ## Normative References
 

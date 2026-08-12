@@ -1,4 +1,5 @@
 import { MAX_ENV_VALUE_SIZE } from '../../constants';
+import { copyEnvEntries } from '../../env-utils';
 import { logger } from '../../logger';
 import { WrapperConfig } from '../../types';
 
@@ -13,16 +14,14 @@ export function passthroughHostEnvironment(params: EnvPassthroughParams): void {
 
   if (config.envAll) {
     const skippedLargeVars: string[] = [];
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined && !excludedEnvVars.has(key) && !Object.prototype.hasOwnProperty.call(environment, key)) {
-        const valueSizeBytes = Buffer.byteLength(value, 'utf8');
-        if (valueSizeBytes > MAX_ENV_VALUE_SIZE) {
-          skippedLargeVars.push(`${key} (${(valueSizeBytes / 1024).toFixed(0)} KB)`);
-          continue;
-        }
-        environment[key] = value;
-      }
-    }
+    copyEnvEntries(process.env, environment, {
+      excludedKeys: excludedEnvVars,
+      noOverwrite: true,
+      maxValueSizeBytes: MAX_ENV_VALUE_SIZE,
+      onSkippedOversized: (key, sizeBytes) => {
+        skippedLargeVars.push(`${key} (${(sizeBytes / 1024).toFixed(0)} KB)`);
+      },
+    });
 
     if (skippedLargeVars.length > 0) {
       logger.warn(`Skipped ${skippedLargeVars.length} oversized env var(s) from --env-all passthrough (>${(MAX_ENV_VALUE_SIZE / 1024).toFixed(0)} KB each):`);
@@ -42,8 +41,8 @@ export function passthroughHostEnvironment(params: EnvPassthroughParams): void {
     'XDG_CONFIG_HOME',
     'GITHUB_SERVER_URL',
     'GITHUB_API_URL',
-    'ACTIONS_ID_TOKEN_REQUEST_URL',
-    'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
+    'AZURE_CONFIG_DIR',
+    'ADO_MCP_AUTH_TOKEN',
     'DOCKER_HOST',
     'DOCKER_TLS',
     'DOCKER_TLS_VERIFY',
@@ -53,6 +52,8 @@ export function passthroughHostEnvironment(params: EnvPassthroughParams): void {
     'DOCKER_API_VERSION',
     'DOCKER_DEFAULT_PLATFORM',
     'COPILOT_OTEL_FILE_EXPORTER_PATH',
+    'GITHUB_AW_OTEL_TRACE_ID',
+    'GITHUB_AW_OTEL_PARENT_SPAN_ID',
   ] as const;
 
   for (const v of alwaysForwardVars) {
@@ -69,7 +70,7 @@ export function passthroughHostEnvironment(params: EnvPassthroughParams): void {
       'COPILOT_GITHUB_TOKEN',
       'COPILOT_PROVIDER_API_KEY',
     ] as const) {
-      if (process.env[v]) {
+      if (process.env[v] && !excludedEnvVars.has(v)) {
         environment[v] = process.env[v]!;
       }
     }

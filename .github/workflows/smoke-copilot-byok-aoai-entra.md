@@ -10,6 +10,7 @@ on:
     remove_label: false
   reaction: "rocket"
 permissions:
+  copilot-requests: write
   contents: read
   pull-requests: read
   issues: read
@@ -21,23 +22,7 @@ engine:
   id: copilot
   env:
     # Direct-BYOK trigger against Azure OpenAI (Foundry) using Microsoft Entra
-    # (GitHub OIDC federated credential) instead of a static api-key. The
-    # sibling smoke-copilot-byok-aoai-apikey workflow exercises the same code
-    # path with COPILOT_PROVIDER_API_KEY; this workflow instead lets the
-    # api-proxy sidecar exchange the GitHub Actions OIDC JWT for an Azure AD
-    # access token (via workload identity federation) and inject it as a
-    # bearer token on upstream requests to the Foundry deployment.
-    #
-    # Only COPILOT_PROVIDER_BASE_URL is wired in under engine.env (because
-    # gh-aw's strict mode allowlists this exact variable here to keep the
-    # secret out of the agent container). The AWF_AUTH_* values live at
-    # workflow-level env (see below) instead, because gh-aw's strict-mode
-    # engine.env secret-leak allowlist does not yet include them.
-    #
-    # For Actions OIDC to work, the agent step must run under an Actions
-    # environment named `aoai-model` (see `environment:` above) whose
-    # protection rules / federated credential subject claim are configured to
-    # accept this repository's workflow.
+    # (GitHub OIDC federated credential) instead of a static api-key.
     COPILOT_PROVIDER_BASE_URL: ${{ secrets.FOUNDRY_OPENAI_ENDPOINT }}
 network:
   allowed:
@@ -68,13 +53,10 @@ safe-outputs:
 timeout-minutes: 15
 env:
   COPILOT_MODEL: o4-mini-aw
-  # AWF_AUTH_* are set at workflow-level env (rather than engine.env) because
-  # gh-aw's strict mode allowlist for engine.env does not currently include
-  # the AWF_AUTH_AZURE_* variables. awf reads these from the agent step's
-  # process.env (via `sudo -E awf …`) and forwards them to the api-proxy
-  # sidecar (see src/services/api-proxy-service-config.ts), which uses them
-  # for the GitHub OIDC → Azure AD federated-credential token exchange. The
-  # agent container itself does not need these values — only the sidecar.
+  # AWF_AUTH_* are set at workflow-level env because gh-aw's strict mode
+  # engine.env allowlist does not yet include AWF_AUTH_AZURE_* variables.
+  # AWF reads these from process.env and forwards them to the api-proxy
+  # sidecar for the GitHub OIDC → Azure AD token exchange.
   AWF_AUTH_TYPE: github-oidc
   AWF_AUTH_PROVIDER: azure
   AWF_AUTH_AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -82,17 +64,9 @@ env:
 sandbox:
   agent:
     id: awf
-# strict: false because gh-aw's strict-mode engine.env/env secret-leak
-# allowlist currently covers COPILOT_PROVIDER_API_KEY / COPILOT_PROVIDER_BASE_URL
-# but does not yet include the AWF_AUTH_AZURE_* keys, so referencing
-# ${{ secrets.AZURE_TENANT_ID }} / ${{ secrets.AZURE_CLIENT_ID }} would fail
-# strict-mode compilation. AWF still forwards these values exclusively to the
-# api-proxy sidecar (see src/services/api-proxy-service-config.ts); they are
-# never written into the agent container's env.
 strict: false
 steps:
   - name: Pre-compute BYOK smoke test data
-    id: smoke-data
     run: |
       echo "::group::Verify BYOK configuration"
       echo "COPILOT_API_TARGET=${COPILOT_API_TARGET:-derived from COPILOT_PROVIDER_BASE_URL}"
@@ -124,16 +98,24 @@ steps:
       echo "Wrote and read back: $FILE_CONTENT"
       echo "::endgroup::"
 
+      # Write results to files for agent context
+      mkdir -p /tmp/gh-aw/agent
+      echo "$HTTP_CODE" > /tmp/gh-aw/agent/smoke-http-code.txt
+      echo "$FILE_CONTENT" > /tmp/gh-aw/agent/smoke-file-content.txt
+      echo "$TEST_FILE" > /tmp/gh-aw/agent/smoke-file-path.txt
+      echo "$PR_DATA" > /tmp/gh-aw/agent/smoke-pr-data.txt
       {
-        echo "SMOKE_PR_DATA<<SMOKE_EOF"
+        echo "event=${GITHUB_EVENT_NAME}"
+        echo "item_number=${PR_NUMBER:-}"
+        echo "http_code=${HTTP_CODE}"
+        echo "file_path=${TEST_FILE}"
+        echo "file_content=${FILE_CONTENT}"
+        echo "recent_prs:"
         echo "$PR_DATA"
-        echo "SMOKE_EOF"
-        echo "SMOKE_HTTP_CODE=$HTTP_CODE"
-        echo "SMOKE_FILE_CONTENT=$FILE_CONTENT"
-        echo "SMOKE_FILE_PATH=$TEST_FILE"
-      } >> "$GITHUB_OUTPUT"
+      } > /tmp/gh-aw/agent/smoke-context.txt
     env:
       GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
 post-steps:
   - name: Validate safe outputs were invoked
     run: |
@@ -182,19 +164,21 @@ This smoke test validates that Copilot CLI runs in **direct BYOK mode against Az
 The following tests were already executed in a deterministic pre-agent step. Your job is to verify the results and produce the summary comment.
 
 ### 1. GitHub MCP Testing
+First read `/tmp/gh-aw/agent/smoke-context.txt` once. It contains the event type, pull request item number, HTTP result, file path/content, and pre-fetched PR data.
+
 Verify MCP connectivity via the GitHub MCP tool `github-list_pull_requests` for ${{ github.repository }} (limit 2, state merged).
 - If the tool responds successfully, confirm the result matches the Pre-Fetched PR Data below. ✅
-- If the tool is unavailable (missing from context), skip the live call and validate the Pre-Fetched PR Data instead. Mark ✅ (pre-fetched data validated). Do **not** call `missing_tool` for this optional skip.
+- If the tool is unavailable or its response is filtered by secrecy policy, validate the Pre-Fetched PR Data instead. Mark ✅ (pre-fetched data validated). Filtering is expected isolation, not a test failure. Do **not** call `missing_tool` for this optional fallback.
 - If the tool is available but the call fails for another reason, mark ❌ and include the error.
 Either way, continue to the **Output** section below and follow the required output rules.
 
 ### 2. GitHub.com Connectivity
-Pre-step result: HTTP ${{ steps.smoke-data.outputs.SMOKE_HTTP_CODE }} from github.com.
+Pre-step result: HTTP (see `/tmp/gh-aw/agent/smoke-http-code.txt`) from github.com.
 ✅ if HTTP 200 or 301, ❌ otherwise.
 
 ### 3. File Write/Read Test
-Pre-step wrote and read back: "${{ steps.smoke-data.outputs.SMOKE_FILE_CONTENT }}"
-File path: ${{ steps.smoke-data.outputs.SMOKE_FILE_PATH }}
+Pre-step wrote and read back: "(see `/tmp/gh-aw/agent/smoke-file-content.txt`)"
+File path: (see `/tmp/gh-aw/agent/smoke-file-path.txt`)
 Verify by running `cat` on the file path using bash to confirm it exists.
 
 ### 4. BYOK Inference Test
@@ -203,12 +187,12 @@ You are running in direct BYOK mode against Azure OpenAI (Foundry) right now, us
 ## Pre-Fetched PR Data
 
 ```
-${{ steps.smoke-data.outputs.SMOKE_PR_DATA }}
+(see `/tmp/gh-aw/agent/smoke-pr-data.txt`)
 ```
 
 ## Output
 
-**If triggered by a pull request**, call `add_comment` to post a **very brief** comment (max 5-10 lines) on the current pull request with:
+**If triggered by a pull request** (`event=pull_request` in the context file), call the `add_comment` safe-output exactly once with `item_number` set to the context file's numeric item number and a **very brief** body (max 5-10 lines) containing:
 - PR titles only (no descriptions)
 - ✅ or ❌ for each test result
 - Note: "Running in direct BYOK mode (AWF_AUTH_TYPE=github-oidc + AWF_AUTH_AZURE_* + COPILOT_PROVIDER_BASE_URL) via api-proxy → Azure OpenAI (Foundry, o4-mini-aw) authenticated via Microsoft Entra"
@@ -217,5 +201,7 @@ ${{ steps.smoke-data.outputs.SMOKE_PR_DATA }}
 
 If all tests pass on a pull request trigger:
 - Use the `add_labels` safe-output tool to add the label `smoke-copilot-byok-aoai-entra` to the pull request
+
+On a pull request trigger, never call `noop`, even when a test fails; the required final action is always `add_comment`. Do not pass `pr_number` to `add_comment`; the required target field is `item_number`.
 
 **If triggered by workflow_dispatch or schedule** (no PR context), call `noop` with a concise PASS/FAIL summary instead. Do NOT attempt to add pull request comments or labels when there is no pull request.

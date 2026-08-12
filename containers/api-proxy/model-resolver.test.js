@@ -9,6 +9,7 @@ const {
   parseModelAliases,
   selectMiddlePowerFallback,
   filterResolvableAliases,
+  filterAvailableModelsToConfiguredProviders,
   resolveModel,
 } = require('./model-resolver');
 const { rewriteModelInBody } = require('./model-body-rewriter');
@@ -127,6 +128,13 @@ describe('resolveModel', () => {
     expect(result.resolvedModel).toBe('gpt-4o');
   });
 
+  it('should treat the Copilot auto model as a pass-through', () => {
+    const result = resolveModel('auto', aliases, availableModels, 'copilot');
+    expect(result).not.toBeNull();
+    expect(result.resolvedModel).toBe('auto');
+    expect(result.fallback.activated).toBe(false);
+  });
+
   it('should be case-insensitive for alias lookup', () => {
     const result = resolveModel('SONNET', aliases, availableModels, 'copilot');
     expect(result).not.toBeNull();
@@ -153,6 +161,36 @@ describe('resolveModel', () => {
     );
     expect(result).not.toBeNull();
     expect(result.resolvedModel).toBe('gpt-5.6-sol');
+  });
+
+  it('preserves an explicit provider model when an alias has the same name', () => {
+    const result = resolveModel(
+      'claude-sonnet-5',
+      { 'claude-sonnet-5': ['copilot/claude-sonnet-6*'] },
+      {
+        anthropic: ['claude-sonnet-5'],
+        copilot: ['claude-sonnet-6'],
+      },
+      'anthropic'
+    );
+    expect(result).not.toBeNull();
+    expect(result.resolvedModel).toBe('claude-sonnet-5');
+    expect(result.candidates).toEqual(['claude-sonnet-5']);
+    expect(result.log).toContain('[model-resolver] direct match: "claude-sonnet-5" → "claude-sonnet-5"');
+  });
+
+  it('expands a same-named alias when referenced recursively', () => {
+    const result = resolveModel(
+      'coding',
+      {
+        coding: ['claude-sonnet-5'],
+        'claude-sonnet-5': ['anthropic/claude-sonnet-6*'],
+      },
+      { anthropic: ['claude-sonnet-5', 'claude-sonnet-6'] },
+      'anthropic'
+    );
+    expect(result).not.toBeNull();
+    expect(result.resolvedModel).toBe('claude-sonnet-6');
   });
 
   it('returns null (terminal) when the exact advertised model is denied by policy — does not fall through to family alias', () => {
@@ -358,6 +396,12 @@ describe('rewriteModelInBody', () => {
     expect(result).toBeNull(); // No rewrite needed
   });
 
+  it('should not rewrite the Copilot auto model', () => {
+    const body = Buffer.from(JSON.stringify({ model: 'auto', messages: [] }));
+    const result = rewriteModelInBody(body, 'copilot', aliases, availableModels);
+    expect(result).toBeNull();
+  });
+
   it('should return null for non-JSON body', () => {
     const body = Buffer.from('not json');
     const result = rewriteModelInBody(body, 'copilot', aliases, availableModels);
@@ -464,6 +508,15 @@ describe('filterResolvableAliases', () => {
     expect(result).not.toHaveProperty('sonnet');
     // 'gpt-5-codex' has no match
     expect(result).not.toHaveProperty('gpt-5-codex');
+  });
+
+  it('should not keep an alias solely because its key is an available model', () => {
+    const collidingAliases = {
+      'claude-sonnet-5': ['anthropic/claude-sonnet-6*'],
+    };
+    const availableModels = { anthropic: ['claude-sonnet-5'] };
+    const result = filterResolvableAliases(collidingAliases, availableModels);
+    expect(result).not.toHaveProperty('claude-sonnet-5');
     // '' → 'sonnet' → no match → filtered out too
     expect(result).not.toHaveProperty('');
   });
@@ -822,5 +875,252 @@ describe('resolveModel — complex alias trees', () => {
     const result = resolveModel('mixed', aliases, baseModels, 'copilot', [], noFallback);
     expect(result).not.toBeNull();
     expect(result.resolvedModel).toBe('gpt-5.2');
+  });
+});
+
+// ── filterAvailableModelsToConfiguredProviders ────────────────────────────────
+
+describe('filterAvailableModelsToConfiguredProviders', () => {
+  const availableModels = {
+    copilot: ['claude-sonnet-4.5', 'gpt-5.4'],
+    anthropic: ['claude-sonnet-5'],
+  };
+
+  it('blanks the model list of providers that are not configured', () => {
+    const result = filterAvailableModelsToConfiguredProviders(
+      availableModels,
+      new Set(['anthropic']),
+    );
+    expect(result.copilot).toBeNull();
+    expect(result.anthropic).toEqual(['claude-sonnet-5']);
+  });
+
+  it('accepts an array of configured provider keys', () => {
+    const result = filterAvailableModelsToConfiguredProviders(availableModels, ['copilot']);
+    expect(result.copilot).toEqual(['claude-sonnet-4.5', 'gpt-5.4']);
+    expect(result.anthropic).toBeNull();
+  });
+
+  it('returns the map unchanged when the configured set is unknown', () => {
+    expect(filterAvailableModelsToConfiguredProviders(availableModels, null)).toBe(availableModels);
+    expect(filterAvailableModelsToConfiguredProviders(availableModels, undefined)).toBe(availableModels);
+  });
+
+  it('blanks every model list when no provider is configured', () => {
+    expect(filterAvailableModelsToConfiguredProviders(availableModels, new Set())).toEqual({
+      copilot: null,
+      anthropic: null,
+    });
+  });
+
+  it('prevents alias resolution from steering to an unconfigured provider', () => {
+    // Copilot-first alias group, but only Anthropic has credentials this run.
+    const aliases = { 'sonnet-6x': ['copilot/*sonnet*', 'anthropic/*sonnet*'] };
+    const configuredOnly = filterAvailableModelsToConfiguredProviders(
+      availableModels,
+      new Set(['anthropic']),
+    );
+
+    // Copilot is unreachable: its own port must not resolve any candidate.
+    expect(resolveModel('sonnet-6x', aliases, configuredOnly, 'copilot', [], { enabled: false })).toBeNull();
+    // Anthropic still resolves normally.
+    const anthropicResolution = resolveModel(
+      'sonnet-6x', aliases, configuredOnly, 'anthropic', [], { enabled: false },
+    );
+    expect(anthropicResolution.resolvedModel).toBe('claude-sonnet-5');
+  });
+
+  it('drops aliases that only resolve on unconfigured providers', () => {
+    const aliases = { 'copilot-only': ['copilot/gpt-5*'] };
+    const configuredOnly = filterAvailableModelsToConfiguredProviders(
+      availableModels,
+      new Set(['anthropic']),
+    );
+    expect(filterResolvableAliases(aliases, configuredOnly)).not.toHaveProperty('copilot-only');
+  });
+
+  it('drops disabled-provider aliases before configured provider models are fetched', () => {
+    const aliases = {
+      'copilot-only': ['copilot/gpt-5*'],
+      'anthropic-only': ['anthropic/*sonnet*'],
+      default: ['anthropic-only'],
+    };
+    const noModelData = filterAvailableModelsToConfiguredProviders(
+      { copilot: ['stale-model'], anthropic: null },
+      new Set(['anthropic']),
+    );
+
+    expect(filterResolvableAliases(aliases, noModelData, new Set(['anthropic']))).toEqual({
+      'anthropic-only': aliases['anthropic-only'],
+      default: aliases.default,
+    });
+  });
+
+  it('keeps aliases for configured providers whose model catalogue is still pending', () => {
+    const aliases = {
+      'openai-model': ['openai/gpt-*'],
+      'anthropic-model': ['anthropic/claude-*'],
+      'copilot-model': ['copilot/gpt-*'],
+    };
+    const configured = new Set(['openai', 'anthropic']);
+    const models = filterAvailableModelsToConfiguredProviders({
+      openai: ['gpt-5.4'],
+      anthropic: null,
+      copilot: ['stale-model'],
+    }, configured);
+
+    expect(filterResolvableAliases(aliases, models, configured)).toEqual({
+      'openai-model': aliases['openai-model'],
+      'anthropic-model': aliases['anthropic-model'],
+    });
+  });
+
+  it('drops all provider aliases when no provider is configured', () => {
+    expect(filterResolvableAliases(
+      { sonnet: ['copilot/*sonnet*'], default: ['sonnet'] },
+      { copilot: null },
+      new Set(),
+    )).toEqual({});
+  });
+});
+
+// ── Cross-provider fan-out regression ──────────────────────────────────────
+//
+// Regression coverage for alias fan-outs that resolve against a single-provider
+// proxy. A nested alias scoped to *other* providers (e.g. "haiku" on an OpenAI
+// proxy) previously triggered middle-power fallback, synthesizing an unrelated
+// model from the full live catalog that then out-ranked its legitimate siblings.
+
+describe('cross-provider alias fan-out', () => {
+  // Mirrors gh-aw's built-in table (pkg/workflow/data/model_aliases.json).
+  const ghAwAliases = {
+    detection: ['small'],
+    small: ['mini'],
+    mini: ['haiku', 'gpt-5-mini', 'gpt-5-nano', 'gemini-flash-lite'],
+    haiku: ['copilot/*haiku*', 'anthropic/*haiku*'],
+    'gpt-5-mini': ['copilot/gpt-5*mini*', 'openai/gpt-5*mini*'],
+    'gpt-5-nano': ['copilot/gpt-5*nano*', 'openai/gpt-5*nano*'],
+    'gemini-flash-lite': ['copilot/gemini-*flash*lite*', 'gemini/gemini-*flash*lite*'],
+  };
+
+  // A live OpenAI catalog containing internal staging models alongside real ones.
+  const openaiCatalog = [
+    'crest-alpha-0416-block-a-cy4-after-40-calls',
+    'crest-alpha-0418-block-cy4.5',
+    'crest-alpha-0420-block-z-cy4.9',
+    'gpt-5-mini-2025-08-07',
+    'gpt-5-nano-2025-08-07',
+    'gpt-4-turbo',
+  ];
+
+  it('resolves a nested fan-out to a legitimate sibling, not a synthesized model', () => {
+    const result = resolveModel('detection', ghAwAliases, { openai: openaiCatalog }, 'openai');
+    expect(result).not.toBeNull();
+    expect(result.resolvedModel).not.toMatch(/^crest-alpha/);
+    expect(['gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']).toContain(result.resolvedModel);
+  });
+
+  it('does not let a provider-mismatched nested alias contribute a candidate', () => {
+    const result = resolveModel('mini', ghAwAliases, { openai: openaiCatalog }, 'openai');
+    expect(result).not.toBeNull();
+    expect(result.candidates.every(c => !c.startsWith('crest-alpha'))).toBe(true);
+  });
+
+  it('still reports fallback as not activated when a genuine match wins', () => {
+    const result = resolveModel('detection', ghAwAliases, { openai: openaiCatalog }, 'openai');
+    expect(result.fallback.activated).toBe(false);
+  });
+
+  it('preserves top-level graceful degradation for a directly requested model', () => {
+    // "haiku" requested directly on an OpenAI proxy still substitutes something
+    // rather than failing outright — only nested references are skipped.
+    const result = resolveModel('haiku', ghAwAliases, { openai: openaiCatalog }, 'openai');
+    expect(result).not.toBeNull();
+    expect(result.fallback.activated).toBe(true);
+  });
+
+  it('yields no candidate when every nested alias targets another provider', () => {
+    const aliases = {
+      onlyremote: ['haiku', 'gemini-flash-lite'],
+      haiku: ['copilot/*haiku*', 'anthropic/*haiku*'],
+      'gemini-flash-lite': ['gemini/gemini-*flash*lite*'],
+    };
+    const result = resolveModel('onlyremote', aliases, { openai: openaiCatalog }, 'openai');
+    expect(result).toBeNull();
+  });
+
+  it('marks fallback activated when only synthesized candidates exist', () => {
+    // The nested alias DOES name the current provider, so it is eligible for
+    // middle-power fallback — its pattern simply matches nothing. The parent then
+    // has no genuine candidate and must fall through to the synthesized one.
+    const aliases = {
+      parent: ['missing-on-openai'],
+      'missing-on-openai': ['openai/no-such-model-*'],
+    };
+    const result = resolveModel('parent', aliases, { openai: openaiCatalog }, 'openai');
+    expect(result).not.toBeNull();
+    expect(result.fallback.activated).toBe(true);
+    expect(result.fallback.reason).toBe('no_alias_match_and_not_in_available_models');
+  });
+
+  it('prefers a genuine match over a synthesized one from a sibling pattern', () => {
+    // One child synthesizes (names openai, matches nothing); the other matches for real.
+    const aliases = {
+      parent: ['missing-on-openai', 'gpt-5-nano'],
+      'missing-on-openai': ['openai/no-such-model-*'],
+      'gpt-5-nano': ['openai/gpt-5*nano*'],
+    };
+    const result = resolveModel('parent', aliases, { openai: openaiCatalog }, 'openai');
+    expect(result).not.toBeNull();
+    expect(result.resolvedModel).toBe('gpt-5-nano-2025-08-07');
+    expect(result.fallback.activated).toBe(false);
+    expect(result.log.some(l => l.includes('ignoring 1 synthesized fallback candidate'))).toBe(true);
+  });
+});
+
+// ── Middle-power price filtering ───────────────────────────────────────────
+
+describe('selectMiddlePowerFallback price filtering', () => {
+  const catalog = [
+    'crest-alpha-0416-block-a',
+    'crest-alpha-0418-block-b',
+    'crest-alpha-0420-block-c',
+    'crest-alpha-0422-block-d',
+    'gpt-4-turbo',
+  ];
+  const isPriceable = m => !m.startsWith('crest-alpha');
+
+  it('excludes unpriceable models from the fallback pool', () => {
+    const result = selectMiddlePowerFallback(
+      'something', { openai: catalog }, 'openai', 'test',
+      { enabled: true, strategy: 'middle_power', isModelPriceable: isPriceable }
+    );
+    expect(result.resolvedModel).toBe('gpt-4-turbo');
+    expect(result.fallback.used_price_filter).toBe(true);
+  });
+
+  it('falls back to the unfiltered pool when nothing is priceable', () => {
+    const result = selectMiddlePowerFallback(
+      'something', { openai: catalog }, 'openai', 'test',
+      { enabled: true, strategy: 'middle_power', isModelPriceable: () => false }
+    );
+    expect(result).not.toBeNull();
+    expect(result.fallback.used_price_filter).toBe(false);
+  });
+
+  it('is a no-op when no predicate is supplied', () => {
+    const withOut = selectMiddlePowerFallback(
+      'something', { openai: catalog }, 'openai', 'test',
+      { enabled: true, strategy: 'middle_power' }
+    );
+    expect(withOut.fallback.used_price_filter).toBe(false);
+  });
+
+  it('treats a throwing predicate as priceable rather than failing resolution', () => {
+    const result = selectMiddlePowerFallback(
+      'something', { openai: catalog }, 'openai', 'test',
+      { enabled: true, strategy: 'middle_power', isModelPriceable: () => { throw new Error('boom'); } }
+    );
+    expect(result).not.toBeNull();
   });
 });

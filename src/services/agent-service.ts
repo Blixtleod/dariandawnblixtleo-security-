@@ -6,7 +6,8 @@ import {
 } from '../constants';
 import { ACT_PRESET_BASE_IMAGE, getSafeHostUid, getSafeHostGid } from '../host-identity';
 import { buildRuntimeImageRef } from '../image-tag';
-import { resolveDockerRuntime, runtimeNeedsStaticDns } from '../container-runtime';
+import { resolveDockerRuntime, runtimeNeedsStaticDns, runtimeUsesComposeAgent } from '../container-runtime';
+import { buildInternalServiceHosts } from './internal-service-hosts';
 import { logger } from '../logger';
 import { WrapperConfig } from '../types';
 import { NetworkConfig, ImageBuildConfig } from './squid-service';
@@ -98,7 +99,11 @@ function buildAgentSecurityConfig(config: WrapperConfig): any {
     // instead of immediately OOM-killing the agent process.
     mem_limit: config.memoryLimit || '6g',
     memswap_limit: config.memoryLimit ? config.memoryLimit : '-1',  // Disable swap when user specifies limit
-    pids_limit: 1000,          // Max 1000 processes
+    // Default 1000 matches the historical hardcoded ceiling; configurable via
+    // --pids-limit / container.pidsLimit for JVM-heavy builds (javac, Android
+    // manifest merger) that spawn many threads and hit "unable to create native
+    // thread" errors under concurrent load. See github/gh-aw-firewall#7148.
+    pids_limit: config.pidsLimit || 1000,
     cpu_shares: 1024,          // Default CPU share
   };
 }
@@ -154,7 +159,9 @@ export function buildAgentService(params: AgentServiceParams): any {
   }
 
   // Enable host.docker.internal for agent when --enable-host-access is set
-  if (config.enableHostAccess) {
+  const shouldInjectHostGateway = config.enableHostAccess &&
+    !(config.networkIsolation && runtimeUsesComposeAgent(config.containerRuntime));
+  if (shouldInjectHostGateway) {
     agentService.extra_hosts = { 'host.docker.internal': 'host-gateway' };
     environment.AWF_ENABLE_HOST_ACCESS = '1';
   }
@@ -175,13 +182,14 @@ export function buildAgentService(params: AgentServiceParams): any {
     // compose-internal services the agent may need to reach by hostname.
     // See: https://github.com/google/gvisor/issues/7469
     if (runtimeNeedsStaticDns(config.containerRuntime)) {
-      if (!agentService.extra_hosts) {
-        agentService.extra_hosts = {};
-      }
-      agentService.extra_hosts['squid-proxy'] = networkConfig.squidIp;
-      if (networkConfig.proxyIp) {
-        agentService.extra_hosts['api-proxy'] = networkConfig.proxyIp;
-      }
+      agentService.extra_hosts = {
+        ...agentService.extra_hosts,
+        ...buildInternalServiceHosts({
+          squidIp: networkConfig.squidIp,
+          apiProxyIp: networkConfig.proxyIp,
+          cliProxyIp: networkConfig.cliProxyIp,
+        }),
+      };
       logger.debug('Injected compose-internal service hosts for static DNS compatibility');
     }
   }
@@ -196,9 +204,7 @@ export function buildAgentService(params: AgentServiceParams): any {
  *
  * Priority: GHCR preset images > local build (when requested or non-preset) > custom image passthrough
  *
- * Returns either `{ image: string }` (pull from registry) or
- * `{ build: { context, dockerfile, args } }` (local build), suitable for
- * spreading onto a Docker Compose service object.
+ * Returns either an image reference or a local build definition.
  */
 function resolveAgentImageConfig(
   config: WrapperConfig,

@@ -4,6 +4,82 @@
 
 import type { LogLevel } from './log-level';
 
+export const FIRECRACKER_RELEASE_VERSION = '1.16.1';
+export const FIRECRACKER_DEFAULT_BINARY = '/usr/local/bin/firecracker';
+export const FIRECRACKER_DEFAULT_JAILER_BINARY = '/usr/local/bin/jailer';
+export const FIRECRACKER_DEFAULT_VCPU_COUNT = 2;
+export const FIRECRACKER_DEFAULT_MEMORY_MIB = 512;
+export const FIRECRACKER_DEFAULT_API_TIMEOUT_MS = 5_000;
+
+export interface FirecrackerArtifactDigests {
+  firecracker?: string;
+  jailer?: string;
+  kernel?: string;
+  rootfs?: string;
+  supervisor?: string;
+}
+
+/**
+ * Preview workload configuration for the Firecracker microVM runtime.
+ *
+ * Host-side network enforcement and guest execution inputs are supplied
+ * directly to FirecrackerManager after live infrastructure discovery.
+ */
+export interface FirecrackerOptions {
+  previewEnabled: boolean;
+  firecrackerBinary: string;
+  jailerBinary: string;
+  kernelPath?: string;
+  rootfsPath?: string;
+  supervisorPath?: string;
+  vcpuCount: number;
+  memoryMib: number;
+  apiTimeoutMs: number;
+  sha256?: FirecrackerArtifactDigests;
+}
+
+// ─── Cloud Hypervisor (v53.0 preview lifecycle backend) ────────────────────
+//
+// This configuration surface pins trusted artifacts and configures the
+// Cloud Hypervisor microVM runtime. It is selectable via
+// `--container-runtime cloud-hypervisor` (gated behind explicit
+// `--cloud-hypervisor-preview` opt-in): see
+// `src/cloud-hypervisor/preflight.ts` for artifact/host validation and
+// `guest/cloud-hypervisor/` for the guest artifact pipeline. GitHub-hosted
+// Ubuntu x86_64 KVM runners are the only supported host target.
+
+export const CLOUD_HYPERVISOR_RELEASE_VERSION = '53.0';
+export const CLOUD_HYPERVISOR_DEFAULT_BINARY = '/usr/local/bin/cloud-hypervisor';
+export const CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT = 2;
+export const CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB = 512;
+export const CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS = 5_000;
+
+export interface CloudHypervisorArtifactDigests {
+  cloudHypervisor?: string;
+  kernel?: string;
+  rootfs?: string;
+  supervisor?: string;
+}
+
+/**
+ * Cloud Hypervisor v53.0 preview microVM runtime settings.
+ *
+ * Selectable via `--container-runtime cloud-hypervisor`, gated behind
+ * explicit `--cloud-hypervisor-preview` opt-in. Supported only on
+ * GitHub-hosted Ubuntu x86_64 KVM runners.
+ */
+export interface CloudHypervisorOptions {
+  previewEnabled: boolean;
+  cloudHypervisorBinary: string;
+  kernelPath?: string;
+  rootfsPath?: string;
+  supervisorPath?: string;
+  vcpuCount: number;
+  memoryMib: number;
+  apiTimeoutMs: number;
+  sha256?: CloudHypervisorArtifactDigests;
+}
+
 export interface RuntimeOptions {
   /**
    * The command to execute inside the firewall container
@@ -161,4 +237,16 @@ export interface RuntimeOptions {
       targetPath?: string;
     };
   };
+
+  /** Firecracker microVM control-plane settings. */
+  firecracker?: FirecrackerOptions;
+
+  /**
+   * Cloud Hypervisor v53.0 preview microVM runtime settings.
+   *
+   * Selectable via `--container-runtime cloud-hypervisor`, gated behind
+   * explicit `--cloud-hypervisor-preview` opt-in. Supported only on
+   * GitHub-hosted Ubuntu x86_64 KVM runners.
+   */
+  cloudHypervisor?: CloudHypervisorOptions;
 }

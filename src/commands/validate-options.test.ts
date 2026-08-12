@@ -54,6 +54,7 @@ const STUB_CONFIG = {
   dnsServers: ['8.8.8.8'],
   dnsOverHttps: undefined,
   memoryLimit: undefined,
+  pidsLimit: undefined,
   proxyLogsDir: undefined,
   auditDir: undefined,
   sessionStateDir: undefined,
@@ -127,6 +128,7 @@ describe('validateOptions', () => {
     mockedOptionParsers.parseEnvironmentVariables.mockReturnValue({ success: true, env: {} });
     mockedOptionParsers.parseVolumeMounts.mockReturnValue({ success: true, mounts: [] });
     mockedOptionParsers.parseMemoryLimit.mockReturnValue({ value: undefined } as ReturnType<typeof optionParsers.parseMemoryLimit>);
+    mockedOptionParsers.parsePidsLimit.mockReturnValue({ value: 1000 } as ReturnType<typeof optionParsers.parsePidsLimit>);
     mockedOptionParsers.applyAgentTimeout.mockImplementation(() => undefined);
     mockedOptionParsers.buildRateLimitConfig.mockReturnValue({
       config: { enabled: false, rpm: 0, rph: 0, bytesPm: 0 },
@@ -143,6 +145,7 @@ describe('validateOptions', () => {
     // --- Preflight / network defaults ---
     mockedPreflight.resolveAllowedDomains.mockReturnValue({
       allowedDomains: ['github.com'],
+      sensitiveAllowedDomains: [],
       localhostResult: {
         localhostDetected: false,
         allowedDomains: ['github.com'],
@@ -155,6 +158,7 @@ describe('validateOptions', () => {
     mockedNetworkSetup.resolveNetworkConfig.mockReturnValue({
       upstreamProxy: undefined,
       dnsServers: ['8.8.8.8'],
+      dnsServersExplicit: false,
       dnsOverHttps: undefined,
     });
 
@@ -468,6 +472,75 @@ describe('validateOptions', () => {
   // Post-config validations (docker host, rate limits, feature flags, ports)
   // ---------------------------------------------------------------------------
 
+  describe('Firecracker runtime validation', () => {
+    const digest = 'a'.repeat(64);
+    const firecracker = {
+      previewEnabled: true,
+      firecrackerBinary: '/opt/firecracker',
+      jailerBinary: '/opt/jailer',
+      kernelPath: '/opt/kernel',
+      rootfsPath: '/opt/rootfs',
+      supervisorPath: '/opt/supervisor',
+      vcpuCount: 2,
+      memoryMib: 512,
+      apiTimeoutMs: 5000,
+      sha256: {
+        firecracker: digest,
+        jailer: digest,
+        kernel: digest,
+        rootfs: digest,
+        supervisor: digest,
+      },
+    };
+
+    function firecrackerConfig(overrides: Record<string, unknown> = {}) {
+      return {
+        ...STUB_CONFIG,
+        containerRuntime: 'firecracker',
+        legacySecurity: false,
+        networkIsolation: undefined,
+        enableApiProxy: undefined,
+        firecracker,
+        ...overrides,
+      };
+    }
+
+    it('accepts a complete strict preview configuration', () => {
+      mockedBuildConfig.buildConfig.mockReturnValue(firecrackerConfig());
+      expect(() => validateOptions(validOptions(), 'echo hi')).not.toThrow();
+    });
+
+    it('rejects Firecracker options for another runtime', () => {
+      mockedBuildConfig.buildConfig.mockReturnValue(firecrackerConfig({
+        containerRuntime: 'gvisor',
+      }));
+      expect(() => validateOptions(validOptions(), 'echo hi')).toThrow('process.exit called');
+      expect(mockedLogger.error).toHaveBeenCalledWith(
+        expect.stringContaining('Firecracker options require'),
+      );
+    });
+
+    it('rejects unsupported Firecracker policy before strict-mode coercion', () => {
+      mockedBuildConfig.buildConfig.mockReturnValue(firecrackerConfig({
+        enableDind: true,
+      }));
+      expect(() => validateOptions(validOptions(), 'echo hi')).toThrow('process.exit called');
+      expect(mockedLogger.error).toHaveBeenCalledWith(
+        expect.stringContaining('does not support Docker-in-Docker'),
+      );
+    });
+
+    it('rejects an incomplete Firecracker runtime after security defaults', () => {
+      mockedBuildConfig.buildConfig.mockReturnValue(firecrackerConfig({
+        firecracker: { ...firecracker, previewEnabled: false },
+      }));
+      expect(() => validateOptions(validOptions(), 'echo hi')).toThrow('process.exit called');
+      expect(mockedLogger.error).toHaveBeenCalledWith(
+        expect.stringContaining('requires explicit --firecracker-preview'),
+      );
+    });
+  });
+
   describe('--docker-host validation', () => {
     it('exits when --docker-host is not a unix:// URI', () => {
       mockedBuildConfig.buildConfig.mockReturnValue({
@@ -572,6 +645,7 @@ describe('validateOptions', () => {
       });
       mockedPreflight.resolveAllowedDomains.mockReturnValue({
         allowedDomains: ['host.docker.internal'],
+        sensitiveAllowedDomains: [],
         localhostResult: {
           localhostDetected: false,
           allowedDomains: ['host.docker.internal'],

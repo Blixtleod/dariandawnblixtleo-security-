@@ -127,6 +127,9 @@ Options:
                                (default: https://dns.google/dns-query)
   --memory-limit <limit>       Memory limit for the agent container (default: 6g)
                                 Examples: 1g, 4g, 512m
+  --pids-limit <limit>         Process/thread ceiling for the agent container (default: 1000)
+                                Increase for JVM-heavy builds (javac, Android manifest
+                                merger) that hit "unable to create native thread" errors
   --enable-dind                Enable Docker-in-Docker by exposing host Docker socket.
                                WARNING: allows firewall bypass via docker run (default: false)
   --docker-host-path-prefix <prefix>  Prefix bind-mount source paths so the Docker daemon can
@@ -459,6 +462,28 @@ sudo awf \
 **Note:** When `--enable-host-access` is enabled without `--allow-host-ports`, all ports on `host.docker.internal` are currently allowed. Use `--allow-host-ports` to explicitly restrict which ports can be accessed (e.g., `--allow-host-ports 80,443,8080` for web services and an MCP gateway).
 
 > **Security Note:** A future update will change the default behavior to only allow ports 80 and 443 unless `--allow-host-ports` is specified. Explicitly set `--allow-host-ports` now to ensure consistent behavior across versions.
+
+### Example: GitHub Actions `services:` Container in Strict Mode
+
+`--allow-host-ports` works standalone with `--enable-host-access` in strict
+security mode (the default, without `--legacy-security`/`--network-isolation`
+disabled). Direct raw-protocol access to a GitHub Actions `services:` container
+is not available in strict (`--network-isolation`) mode: the isolated agent has
+no `host.docker.internal` route, and clients such as `psql` cannot use Squid's
+HTTP proxy protocol. Use legacy security or a separately verified tunnel. For
+example, to reach a Postgres service container with legacy security:
+
+```bash
+# GitHub Actions services: postgres:
+#   ports: ["5432:5432"]
+
+awf \
+  --legacy-security \
+  --enable-host-access \
+  --allow-host-ports 5432 \
+  --allow-domains host.docker.internal \
+  -- psql -h host.docker.internal -p 5432 -U postgres -c 'select 1'
+```
 
 ### CONNECT Method on Port 80
 

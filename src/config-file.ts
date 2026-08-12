@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { validateWithSchema } from './schema-validator';
+import type { RawEnclavesConfig } from './types/enclave-options';
+import type { FirecrackerArtifactDigests, CloudHypervisorArtifactDigests } from './types/runtime-options';
 
 /** @internal Used only by config-file helpers — not part of public API */
 // ts-prune-ignore-next
@@ -23,6 +25,7 @@ export interface AwfFileConfig {
     maxEffectiveTokens?: number;
     maxAiCredits?: number;
     defaultAiCreditsPricing?: { input: number; output: number; cachedInput?: number; cacheWrite?: number | null };
+    providers?: Record<string, unknown>;
     modelMultipliers?: Record<string, number>;
     defaultModelMultiplier?: number;
     maxModelMultiplierCap?: number;
@@ -103,6 +106,7 @@ export interface AwfFileConfig {
   };
   container?: {
     memoryLimit?: string;
+    pidsLimit?: number;
     agentTimeout?: number;
     enableDind?: boolean;
     workDir?: string;
@@ -118,6 +122,35 @@ export interface AwfFileConfig {
     containerRuntime?: string;
     runnerToolCachePath?: string;
     mounts?: string[];
+  };
+  firecracker?: {
+    previewEnabled?: boolean;
+    firecrackerBinary?: string;
+    jailerBinary?: string;
+    kernelPath?: string;
+    rootfsPath?: string;
+    supervisorPath?: string;
+    vcpuCount?: number;
+    memoryMib?: number;
+    apiTimeoutMs?: number;
+    sha256?: FirecrackerArtifactDigests;
+  };
+  /**
+   * Cloud Hypervisor v53.0 preview microVM runtime.
+   * Selectable via `container.containerRuntime: "cloud-hypervisor"`, gated
+   * behind `previewEnabled`/`--cloud-hypervisor-preview`. Supported only on
+   * GitHub-hosted Ubuntu x86_64 KVM runners.
+   */
+  cloudHypervisor?: {
+    previewEnabled?: boolean;
+    cloudHypervisorBinary?: string;
+    kernelPath?: string;
+    rootfsPath?: string;
+    supervisorPath?: string;
+    vcpuCount?: number;
+    memoryMib?: number;
+    apiTimeoutMs?: number;
+    sha256?: CloudHypervisorArtifactDigests;
   };
   chroot?: {
     binariesSourcePath?: string;
@@ -162,6 +195,8 @@ export interface AwfFileConfig {
     topology?: 'standard' | 'arc-dind';
     sysrootImage?: string;
   };
+  /** Unified enclave configuration exposed only through the trusted MCP gateway. */
+  enclaves?: RawEnclavesConfig;
 }
 
 /**

@@ -10,8 +10,16 @@ import { buildSquidService } from './services/squid-service';
 import { buildAgentEnvironment, buildAgentVolumes, buildAgentService } from './services/agent-service';
 import { assembleOptionalServices } from './services/optional-services';
 import { buildComposeNetworks } from './compose-network';
-import { runtimeUsesComposeAgent } from './container-runtime';
+import { runtimeNeedsStaticDns, runtimeUsesComposeAgent } from './container-runtime';
 import { API_PROXY_PORTS } from './types/ports';
+import { EXTERNAL_BRIDGE_NAME } from './config/network-policy';
+import {
+  ENCLAVE_AGENT_EGRESS_NETWORK,
+  ENCLAVE_AGENT_NETWORK,
+  ENCLAVE_AGENT_SUBNET,
+  ENCLAVE_MCP_CONTROL_NETWORK,
+} from './enclave/network';
+import { buildInternalServiceHosts } from './services/internal-service-hosts';
 
 /**
  * Generates Docker Compose configuration
@@ -87,6 +95,13 @@ export function generateDockerCompose(
 
   const agentVolumes = buildAgentVolumes({
     config,
+    internalServiceHosts: runtimeNeedsStaticDns(config.containerRuntime)
+      ? buildInternalServiceHosts({
+          squidIp: networkConfig.squidIp,
+          apiProxyIp: networkConfig.proxyIp,
+          cliProxyIp: networkConfig.cliProxyIp,
+        })
+      : undefined,
     sslConfig,
     projectRoot,
     effectiveHome,
@@ -141,7 +156,7 @@ export function generateDockerCompose(
   // In network-isolation mode the internal network blocks host→container traffic,
   // so we also attach api-proxy to the external bridge (`awf-ext`) — same as
   // Squid — so published ports are reachable from outside Docker.
-  if (!includeAgent && services['api-proxy']) {
+  if (!includeAgent && config.containerRuntime !== 'firecracker' && services['api-proxy']) {
     const proxyService = services['api-proxy'];
     if (!proxyService.ports) {
       proxyService.ports = [];
@@ -153,14 +168,14 @@ export function generateDockerCompose(
     if (config.networkIsolation) {
       proxyService.networks = {
         ...(proxyService.networks || {}),
-        'awf-ext': {},
+        [EXTERNAL_BRIDGE_NAME]: {},
       };
     }
   }
 
   // ── Assemble and return the compose result ─────────────────────────────────
 
-  return buildComposeNetworks({
+  const compose = buildComposeNetworks({
     services,
     squidService,
     agentService,
@@ -168,6 +183,36 @@ export function generateDockerCompose(
     networkConfig,
     namedVolumes,
   });
+  if (config.enclaves?.enabled && config.enclaves.executors.agent.enabled) {
+    // Dedicated `internal` network whose only members are unified-enclave
+    // agent enclaves and the dual-homed dedicated API proxy. An explicit
+    // `name:` is required because the enclave MCP server launches enclaves
+    // with a fixed `docker run --network <name>` argument and must not have to
+    // derive a Compose project prefix at runtime.
+    compose.networks[ENCLAVE_AGENT_NETWORK] = {
+      name: ENCLAVE_AGENT_NETWORK,
+      driver: 'bridge',
+      internal: true,
+      ipam: {
+        config: [{ subnet: ENCLAVE_AGENT_SUBNET }],
+      },
+    };
+    // Only the dedicated credential sidecar joins this bridge. It receives
+    // direct upstream egress while enclaves remain confined to the internal
+    // network and the primary agent cannot observe its metrics or state.
+    compose.networks[ENCLAVE_AGENT_EGRESS_NETWORK] = {
+      name: ENCLAVE_AGENT_EGRESS_NETWORK,
+      driver: 'bridge',
+    };
+  }
+  if (config.enclaves?.enabled) {
+    compose.networks[ENCLAVE_MCP_CONTROL_NETWORK] = {
+      name: ENCLAVE_MCP_CONTROL_NETWORK,
+      driver: 'bridge',
+      internal: true,
+    };
+  }
+  return compose;
 }
 
 /**

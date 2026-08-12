@@ -1,11 +1,16 @@
 'use strict';
 
-const { parseModelAliases, filterResolvableAliases } = require('./model-resolver');
+const {
+  parseModelAliases,
+  filterResolvableAliases,
+  filterAvailableModelsToConfiguredProviders,
+} = require('./model-resolver');
 const { rewriteModelInBody } = require('./model-body-rewriter');
 const { sanitizeForLog, logRequest } = require('./logging');
 const { diag } = require('./token-persistence');
 const { getCopilotModelFallbackPolicy } = require('./providers/copilot-auth');
 const { ALLOWED_MODELS, DISALLOWED_MODELS } = require('./guards/model-policy-guard');
+const { isModelPriceable } = require('./guards/ai-credits-guard');
 
 const MODEL_ALIASES_RAW = (process.env.AWF_MODEL_ALIASES || '').trim() || undefined;
 const MODEL_ALIASES = parseModelAliases(MODEL_ALIASES_RAW);
@@ -67,6 +72,23 @@ logRequest('info', 'startup', {
   model_fallback: MODEL_FALLBACK,
 });
 
+/**
+ * Build a predicate that reports whether the AI-credits guard can price a model.
+ *
+ * Used to keep the middle-power fallback from synthesizing a model that the
+ * guard would immediately reject. Returns null (no filtering) unless the guard
+ * is actually active — i.e. a credit cap is set with no configured default
+ * pricing — so pricing coverage never constrains resolution otherwise.
+ *
+ * @param {string} provider
+ * @returns {((model: string) => boolean)|null}
+ */
+function makeIsModelPriceable(provider) {
+  if (!process.env.AWF_MAX_AI_CREDITS) return null;
+  if (process.env.AWF_DEFAULT_AI_CREDITS_PRICING) return null;
+  return (model) => isModelPriceable(model, provider);
+}
+
 function getModelFallbackPolicyForProvider(provider) {
   if (MODEL_FALLBACK.excludeEngines && MODEL_FALLBACK.excludeEngines.includes(provider.toLowerCase())) {
     return {
@@ -82,7 +104,8 @@ function getModelFallbackPolicyForProvider(provider) {
 }
 
 function getModelFallbackForProvider(provider) {
-  return getModelFallbackPolicyForProvider(provider).effective;
+  const effective = getModelFallbackPolicyForProvider(provider).effective;
+  return { ...effective, isModelPriceable: makeIsModelPriceable(provider) };
 }
 
 function getEffectiveModelFallbackForReflect(adapters) {
@@ -98,14 +121,19 @@ function getEffectiveModelFallbackForReflect(adapters) {
   return effectiveByProvider;
 }
 
-function makeModelBodyTransform(provider, cachedModels, refreshProviderModelsForResolution) {
+function makeModelBodyTransform(provider, cachedModels, refreshProviderModelsForResolution, getConfiguredModelCacheKeys) {
   if (!MODEL_ALIASES) return null;
   const providerModelFallback = getModelFallbackForProvider(provider);
+  const resolvableModels = () => (
+    getConfiguredModelCacheKeys
+      ? filterAvailableModelsToConfiguredProviders(cachedModels, getConfiguredModelCacheKeys())
+      : cachedModels
+  );
   return async (body, req) => {
-    let result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, cachedModels, providerModelFallback, MODEL_POLICY_CONFIG);
+    let result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
     if (!result || (result.fallback && result.fallback.activated)) {
       await refreshProviderModelsForResolution(provider);
-      result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, cachedModels, providerModelFallback, MODEL_POLICY_CONFIG);
+      result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
     }
     if (!result) return null;
     // Store ranked candidates on the request object so endpoint-blocked retry
@@ -166,6 +194,7 @@ function makeModelBodyTransform(provider, cachedModels, refreshProviderModelsFor
 
 module.exports = {
   MODEL_ALIASES,
+  filterAvailableModelsToConfiguredProviders,
   MODEL_FALLBACK,
   MODEL_POLICY_CONFIG,
   parseModelFallbackConfig,

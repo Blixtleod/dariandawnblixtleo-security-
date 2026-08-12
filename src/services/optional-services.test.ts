@@ -39,6 +39,22 @@ describe('optional-services helpers', () => {
       expect(environment.AWF_API_PROXY_IP).toBeUndefined();
       expect(environment.AWF_CLI_PROXY_IP).toBeUndefined();
       expect(environment.AWF_NETWORK_ISOLATION).toBeUndefined();
+      expect(environment.AWF_SKIP_IPTABLES_INIT).toBeUndefined();
+    });
+
+    it('sets AWF_SKIP_IPTABLES_INIT for gVisor without network isolation', () => {
+      const environment: Record<string, string> = {};
+      const config: WrapperConfig = {
+        ...baseConfig,
+        workDir: '/tmp/awf-work',
+        containerRuntime: 'gvisor',
+      };
+
+      testHelpers.presetSidecarIpEnvVars(environment, config, mockNetworkConfig);
+
+      expect(environment.AWF_SKIP_IPTABLES_INIT).toBe('1');
+      // gVisor is not network-isolation (topology) mode
+      expect(environment.AWF_NETWORK_ISOLATION).toBeUndefined();
     });
   });
 
@@ -47,6 +63,7 @@ describe('optional-services helpers', () => {
       const config: WrapperConfig = {
         ...baseConfig,
         workDir: '/tmp/awf-work',
+        volumeMounts: ['/home/runner:/home/runner:rw'],
       };
 
       const filtered = testHelpers.filterAgentVolumesForSysroot(
@@ -65,10 +82,89 @@ describe('optional-services helpers', () => {
       );
 
       expect(filtered).toEqual([
+        '/home/runner:/host/home/runner:rw',
         '/home/runner/_work/_temp/gh-aw:/host/home/runner/_work/_temp/gh-aw:rw',
         '/tmp:/tmp:rw',
         '/dev/null:/host/home/runner/.npmrc:ro',
         'bad-volume-entry',
+      ]);
+    });
+
+    it('drops the chroot-home volume but keeps an explicitly mounted writable home', () => {
+      const config: WrapperConfig = {
+        ...baseConfig,
+        workDir: '/tmp/awf-work',
+        volumeMounts: ['/home/runner/_work/_temp/gh-aw/home:/home/runner/_work/_temp/gh-aw/home:rw'],
+      };
+      const home = '/home/runner/_work/_temp/gh-aw/home';
+
+      const filtered = testHelpers.filterAgentVolumesForSysroot(
+        [
+          `/tmp/awf-work-chroot-home:/host${home}:rw`,
+          `${home}:/host${home}:rw`,
+          `/dev/null:/host${home}/.npmrc:ro`,
+          `/dev/null:${home}/.npmrc:ro`,
+        ],
+        config,
+        home,
+      );
+
+      expect(filtered).toEqual([
+        `${home}:/host${home}:rw`,
+        `/dev/null:/host${home}/.npmrc:ro`,
+        `/dev/null:${home}/.npmrc:ro`,
+      ]);
+    });
+
+    it('does not exempt AWF home mounts that merely share a target with an explicit mount', () => {
+      const config: WrapperConfig = {
+        ...baseConfig,
+        workDir: '/tmp/awf-work',
+        volumeMounts: [
+          '/daemon/cache:/home/runner/.cache:rw',
+          '/home/runner/_work/_temp/gh-aw/home:/home/runner:rw',
+        ],
+      };
+
+      const filtered = testHelpers.filterAgentVolumesForSysroot(
+        [
+          '/home/runner/.cache:/host/home/runner/.cache:rw',
+          '/daemon/cache:/host/home/runner/.cache:rw',
+          '/home/runner/_work/_temp/gh-aw/home:/host/home/runner:rw',
+        ],
+        config,
+        '/home/runner',
+      );
+
+      // AWF's own $HOME/.cache bind (runner-side source) is still dropped even
+      // though an explicit mount targets the same path.
+      expect(filtered).toEqual([
+        '/daemon/cache:/host/home/runner/.cache:rw',
+        '/home/runner/_work/_temp/gh-aw/home:/host/home/runner:rw',
+      ]);
+    });
+
+    it('skips /host$HOME credential overlays when no writable /host$HOME survives', () => {
+      const config: WrapperConfig = {
+        ...baseConfig,
+        workDir: '/tmp/awf-work',
+      };
+      const home = '/home/runner/_work/_temp/gh-aw/home';
+
+      const filtered = testHelpers.filterAgentVolumesForSysroot(
+        [
+          `/tmp/awf-work-chroot-home:/host${home}:rw`,
+          `/dev/null:/host${home}/.npmrc:ro`,
+          `/dev/null:${home}/.npmrc:ro`,
+          '/tmp:/tmp:rw',
+        ],
+        config,
+        home,
+      );
+
+      expect(filtered).toEqual([
+        `/dev/null:${home}/.npmrc:ro`,
+        '/tmp:/tmp:rw',
       ]);
     });
   });

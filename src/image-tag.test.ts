@@ -1,7 +1,17 @@
 import path from 'path';
 import { parseImageTag, buildRuntimeImageRef, assignImageSource } from './image-tag';
 
-const IMAGE_DIGEST_KEYS = ['squid', 'agent', 'agent-act', 'api-proxy', 'cli-proxy', 'build-tools'] as const;
+const IMAGE_DIGEST_KEYS = [
+  'squid',
+  'agent',
+  'agent-act',
+  'api-proxy',
+  'cli-proxy',
+  'build-tools',
+  'enclave-script',
+  'enclave-agent',
+  'enclave-mcp-server',
+] as const;
 
 const VALID_DIGEST = 'sha256:' + 'a'.repeat(64);
 
@@ -29,7 +39,7 @@ describe('parseImageTag', () => {
 
     it('should handle all supported digest keys', () => {
       const expectedDigests = Object.fromEntries(
-        IMAGE_DIGEST_KEYS.map((key, i) => [key, `sha256:${'a'.repeat(63)}${i}`])
+        IMAGE_DIGEST_KEYS.map((key, i) => [key, `sha256:${(i % 16).toString(16).repeat(64)}`])
       ) as Record<(typeof IMAGE_DIGEST_KEYS)[number], string>;
       const entries = IMAGE_DIGEST_KEYS.map((key) => `${key}=${expectedDigests[key]}`).join(',');
       const result = parseImageTag(`latest,${entries}`);

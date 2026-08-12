@@ -1,4 +1,4 @@
-import { detectHostDnsServers, DEFAULT_DNS_SERVERS } from './dns-resolver';
+import { detectHostDnsServers, DEFAULT_DNS_SERVERS, filterForNetworkIsolation } from './dns-resolver';
 import * as fs from 'fs';
 
 jest.mock('fs');
@@ -119,5 +119,93 @@ describe('detectHostDnsServers', () => {
 describe('DEFAULT_DNS_SERVERS', () => {
   it('should have correct default DNS servers', () => {
     expect(DEFAULT_DNS_SERVERS).toEqual(['8.8.8.8', '8.8.4.4']);
+  });
+});
+
+describe('filterForNetworkIsolation', () => {
+  const unreachable = jest.fn().mockResolvedValue(false);
+
+  it('returns public DNS servers unchanged', async () => {
+    const result = await filterForNetworkIsolation(['8.8.8.8', '8.8.4.4'], mockLogger as any, unreachable);
+    expect(result).toEqual(['8.8.8.8', '8.8.4.4']);
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+    expect(unreachable).not.toHaveBeenCalled();
+  });
+
+  it('removes unreachable Azure DHCP DNS and warns', async () => {
+    const result = await filterForNetworkIsolation(['168.63.129.16'], mockLogger as any, unreachable);
+    expect(result).toEqual(DEFAULT_DNS_SERVERS);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('168.63.129.16')
+    );
+  });
+
+  it('removes unreachable Tailscale Magic DNS and warns', async () => {
+    const result = await filterForNetworkIsolation(['100.100.100.100'], mockLogger as any, unreachable);
+    expect(result).toEqual(DEFAULT_DNS_SERVERS);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('100.100.100.100')
+    );
+  });
+
+  it('removes unreachable link-local DNS addresses', async () => {
+    const result = await filterForNetworkIsolation(['169.254.1.1'], mockLogger as any, unreachable);
+    expect(result).toEqual(DEFAULT_DNS_SERVERS);
+    expect(mockLogger.warn).toHaveBeenCalled();
+  });
+
+  it('retains a reachable link-local DNS address', async () => {
+    const reachable = jest.fn().mockResolvedValue(true);
+    const result = await filterForNetworkIsolation(
+      ['169.254.20.10'],
+      mockLogger as any,
+      reachable
+    );
+    expect(result).toEqual(['169.254.20.10']);
+    expect(reachable).toHaveBeenCalledWith('169.254.20.10');
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('retaining reachable')
+    );
+  });
+
+  it('keeps portable servers when mixed with unreachable non-portable servers', async () => {
+    const result = await filterForNetworkIsolation(
+      ['168.63.129.16', '8.8.8.8', '1.1.1.1'],
+      mockLogger as any,
+      unreachable
+    );
+    expect(result).toEqual(['8.8.8.8', '1.1.1.1']);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('168.63.129.16')
+    );
+  });
+
+  it('falls back to DEFAULT_DNS_SERVERS when all servers are unreachable', async () => {
+    const result = await filterForNetworkIsolation(
+      ['168.63.129.16', '100.100.100.100', '169.254.1.1'],
+      mockLogger as any,
+      unreachable
+    );
+    expect(result).toEqual(DEFAULT_DNS_SERVERS);
+    // Two separate warn calls: one for filtering, one for fallback
+    expect(mockLogger.warn).toHaveBeenCalledTimes(2);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('no reachable DNS servers remain')
+    );
+  });
+
+  it('keeps RFC1918 corporate DNS servers intact', async () => {
+    const result = await filterForNetworkIsolation(
+      ['10.0.0.1', '192.168.1.1'],
+      mockLogger as any,
+      unreachable
+    );
+    expect(result).toEqual(['10.0.0.1', '192.168.1.1']);
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it('uses default logger when no logger is provided', async () => {
+    // Should not throw when called without a logger
+    await expect(filterForNetworkIsolation(['8.8.8.8'])).resolves.toEqual(['8.8.8.8']);
   });
 });

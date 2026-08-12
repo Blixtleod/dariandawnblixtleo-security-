@@ -1,23 +1,7 @@
-// Module-level mock functions for fs — must be declared before jest.mock('fs')
-// so the factory can close over them. jest.mock is hoisted but the factory runs
-// lazily after module initialisation, when these variables are defined.
-const mockMkdirSync = jest.fn();
-const mockWriteFileSync = jest.fn();
-const mockChmodSync = jest.fn();
-const mockOpenSync = jest.fn().mockReturnValue(42);
-const mockCloseSync = jest.fn();
+import { mainActionFsMocks } from './main-action-fs-mock.test-utils';
 
-jest.mock('fs', () => {
-  const actual = jest.requireActual<typeof import('fs')>('fs');
-  return {
-    ...actual,
-    mkdirSync: (...args: unknown[]) => mockMkdirSync(...args),
-    writeFileSync: (...args: unknown[]) => mockWriteFileSync(...args),
-    chmodSync: (...args: unknown[]) => mockChmodSync(...args),
-    openSync: (...args: unknown[]) => mockOpenSync(...args),
-    closeSync: (...args: unknown[]) => mockCloseSync(...args),
-  };
-});
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+jest.mock('fs', () => require('./main-action-fs-mock.test-utils').mainActionFsMockFactory());
 
 import { createMainAction, testHelpers } from './main-action';
 
@@ -34,6 +18,14 @@ jest.mock('./preflight');
 jest.mock('./signal-handler');
 jest.mock('./validate-options');
 jest.mock('../sbx-manager');
+jest.mock('../enclave/gateway');
+jest.mock('../external-runtime-backend-resolver', () => {
+  const actual = jest.requireActual('../external-runtime-backend-resolver');
+  return {
+    ...actual,
+    resolveExternalRuntimeBackend: jest.fn(actual.resolveExternalRuntimeBackend),
+  };
+});
 
 import { logger } from '../logger';
 import * as dockerManager from '../docker-manager';
@@ -47,6 +39,17 @@ import * as preflight from './preflight';
 import * as signalHandler from './signal-handler';
 import * as validateOptions from './validate-options';
 import * as sbxManager from '../sbx-manager';
+import * as enclaveGateway from '../enclave/gateway';
+import * as externalRuntimeResolver from '../external-runtime-backend-resolver';
+import { MAIN_ACTION_STUB_CONFIG, setupMainActionTestHarness } from './main-action.test-utils';
+
+const {
+  mkdirSync: mockMkdirSync,
+  writeFileSync: mockWriteFileSync,
+  chmodSync: mockChmodSync,
+  openSync: mockOpenSync,
+  closeSync: mockCloseSync,
+} = mainActionFsMocks;
 
 const mockedLogger = logger as jest.Mocked<typeof logger>;
 const mockedDockerManager = dockerManager as jest.Mocked<typeof dockerManager>;
@@ -60,24 +63,8 @@ const mockedPreflight = preflight as jest.Mocked<typeof preflight>;
 const mockedSignalHandler = signalHandler as jest.Mocked<typeof signalHandler>;
 const mockedValidateOptions = validateOptions as jest.Mocked<typeof validateOptions>;
 const mockedSbxManager = sbxManager as jest.Mocked<typeof sbxManager>;
-
-/** Minimal WrapperConfig returned by the validateOptions mock. */
-const STUB_CONFIG = {
-  allowedDomains: ['github.com'],
-  blockedDomains: undefined,
-  agentCommand: 'echo hi',
-  logLevel: 'info',
-  keepContainers: false,
-  workDir: '/tmp/awf-test',
-  imageRegistry: 'ghcr.io/github/gh-aw-firewall',
-  imageTag: 'latest',
-  buildLocal: false,
-  dnsServers: ['8.8.8.8'],
-  awfDockerHost: undefined,
-  proxyLogsDir: undefined,
-  auditDir: undefined,
-  sessionStateDir: undefined,
-} as unknown as import('../types').WrapperConfig;
+const mockedEnclaveGateway = enclaveGateway as jest.Mocked<typeof enclaveGateway>;
+const mockedExternalRuntimeResolver = externalRuntimeResolver as jest.Mocked<typeof externalRuntimeResolver>;
 
 describe('createMainAction', () => {
   let processExitSpy: jest.SpyInstance;
@@ -85,36 +72,21 @@ describe('createMainAction', () => {
   let getOptionValueSource: jest.Mock;
 
   beforeEach(() => {
-    jest.clearAllMocks();
-    processExitSpy = jest.spyOn(process, 'exit').mockImplementation((code?: string | number | null) => {
-      if (code === 1) {
-        throw new Error(`process.exit: ${code}`);
-      }
-      return undefined as never;
+    const harness = setupMainActionTestHarness({
+      mockedPreflight,
+      mockedValidateOptions,
+      mockedDockerManager,
+      mockedRedactSecrets,
+      mockedOptionParsers,
+      mockedDindProbe,
+      mockedDindBootstrap,
+      mockedSignalHandler,
+      mockedCliWorkflow,
+      mockedSbxManager,
     });
-    consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
-    getOptionValueSource = jest.fn().mockReturnValue(undefined);
-
-    // Default mock implementations
-    mockedPreflight.applyConfigFilePrecedence.mockImplementation(() => {});
-    mockedValidateOptions.validateOptions.mockImplementation(
-      () => ({ ...STUB_CONFIG } as unknown as import('../types').WrapperConfig)
-    );
-    mockedDockerManager.setAwfDockerHost.mockImplementation(() => {});
-    mockedRedactSecrets.redactSecrets.mockImplementation((s: string) => s);
-    mockedOptionParsers.joinShellArgs.mockImplementation((args: string[]) => args.join(' '));
-    mockedDindProbe.probeSplitFilesystem.mockResolvedValue({
-      prefix: undefined,
-      splitDetected: false,
-      inconclusive: false,
-    });
-    mockedDindBootstrap.runDindBootstrap.mockResolvedValue(undefined);
-    mockedSignalHandler.registerSignalHandlers.mockImplementation(() => {});
-    mockedCliWorkflow.runMainWorkflow.mockResolvedValue(0);
-    mockedSbxManager.isSbxAvailable.mockResolvedValue(true);
-    mockedSbxManager.createSandbox.mockResolvedValue('awf-agent-test');
-    mockedSbxManager.execInSandbox.mockResolvedValue({ exitCode: 0 });
-    mockedSbxManager.removeSandbox.mockResolvedValue(undefined);
+    processExitSpy = harness.processExitSpy;
+    consoleErrorSpy = harness.consoleErrorSpy;
+    getOptionValueSource = harness.getOptionValueSource;
   });
 
   afterEach(() => {
@@ -130,6 +102,36 @@ describe('createMainAction', () => {
       expect(mockedOptionParsers.joinShellArgs).not.toHaveBeenCalled();
       expect(consoleErrorSpy).toHaveBeenCalledWith(
         expect.stringContaining('No command specified')
+      );
+    });
+
+    it('runs the reflection endpoint when --reflect is set', async () => {
+      const action = createMainAction(getOptionValueSource);
+      await action([], { reflect: true });
+      expect(mockedValidateOptions.validateOptions).toHaveBeenCalledWith(
+        expect.anything(),
+        'curl --fail --silent --show-error --noproxy "*" http://api-proxy:10000/reflect'
+      );
+      expect(mockedOptionParsers.joinShellArgs).not.toHaveBeenCalled();
+      expect(mockedCliWorkflow.runMainWorkflow).toHaveBeenCalledWith(
+        expect.objectContaining({
+          additionalEnv: expect.objectContaining({
+            AWF_COMMAND_STDOUT_ONLY: '1',
+          }),
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('when --reflect is used with a command', () => {
+    it('exits with code 1 and prints a usage error', async () => {
+      const action = createMainAction(getOptionValueSource);
+      await expect(action(['echo hi'], { reflect: true })).rejects.toThrow('process.exit: 1');
+      expect(processExitSpy).toHaveBeenCalledWith(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('--reflect cannot be used with a command')
       );
     });
   });
@@ -183,13 +185,35 @@ describe('createMainAction', () => {
     });
 
     it('calls setAwfDockerHost with config.awfDockerHost', async () => {
-      const configWithDockerHost = { ...STUB_CONFIG, awfDockerHost: '/var/run/docker.sock' };
+      const configWithDockerHost = { ...MAIN_ACTION_STUB_CONFIG, awfDockerHost: '/var/run/docker.sock' };
       mockedValidateOptions.validateOptions.mockReturnValue(
         configWithDockerHost as unknown as import('../types').WrapperConfig
       );
       const action = createMainAction(getOptionValueSource);
       await action(['echo hi'], {});
       expect(mockedDockerManager.setAwfDockerHost).toHaveBeenCalledWith('/var/run/docker.sock');
+    });
+
+    it('passes containerRuntime through to runAgentCommand', async () => {
+      mockedValidateOptions.validateOptions.mockReturnValue({
+        ...MAIN_ACTION_STUB_CONFIG,
+        containerRuntime: 'gvisor',
+      } as unknown as import('../types').WrapperConfig);
+      mockedCliWorkflow.runMainWorkflow.mockImplementation(async (_config, deps) => {
+        await deps.runAgentCommand('/tmp/awf-test', ['github.com'], undefined, 10);
+        return 0;
+      });
+
+      const action = createMainAction(getOptionValueSource);
+      await action(['echo hi'], {});
+
+      expect(mockedDockerManager.runAgentCommand).toHaveBeenCalledWith(
+        '/tmp/awf-test',
+        ['github.com'],
+        undefined,
+        10,
+        'gvisor'
+      );
     });
 
     it('registers signal handlers', async () => {
@@ -201,12 +225,12 @@ describe('createMainAction', () => {
     it('runs DinD bootstrap before workflow execution', async () => {
       const action = createMainAction(getOptionValueSource);
       await action(['echo hi'], {});
-      expect(mockedDindBootstrap.runDindBootstrap).toHaveBeenCalledWith(STUB_CONFIG);
+      expect(mockedDindBootstrap.runDindBootstrap).toHaveBeenCalledWith(MAIN_ACTION_STUB_CONFIG);
     });
 
     it('skips probe and DinD bootstrap when dockerHostPathPrefix is already set', async () => {
       mockedValidateOptions.validateOptions.mockReturnValue({
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         dockerHostPathPrefix: '/host',
       } as unknown as import('../types').WrapperConfig);
 
@@ -249,7 +273,7 @@ describe('createMainAction', () => {
 
     it('logs empty DNS servers when dnsServers is undefined', async () => {
       mockedValidateOptions.validateOptions.mockReturnValue({
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         dnsServers: undefined,
       } as unknown as import('../types').WrapperConfig);
 
@@ -269,7 +293,7 @@ describe('createMainAction', () => {
 
     it('logs blocked domains when present', async () => {
       const configWithBlocked = {
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         blockedDomains: ['evil.com'],
       };
       mockedValidateOptions.validateOptions.mockReturnValue(
@@ -303,7 +327,7 @@ describe('createMainAction', () => {
     describe('sbx runtime wiring', () => {
       it('passes configured mounts/workdir/environment into sbx create/exec', async () => {
         const sbxConfig = {
-          ...STUB_CONFIG,
+          ...MAIN_ACTION_STUB_CONFIG,
           containerRuntime: 'sbx',
           containerWorkDir: '/home/runner/work/repo/repo',
           volumeMounts: ['/tmp/tooling:/tmp/tooling:ro'],
@@ -323,6 +347,13 @@ describe('createMainAction', () => {
         expect(mockedSbxManager.createSandbox).toHaveBeenCalledWith(expect.objectContaining({
           extraMounts: ['/tmp/tooling:/tmp/tooling:ro'],
         }));
+        expect(mockedSbxManager.assertSbxApiProxyReflect).toHaveBeenCalledWith(
+          'awf-agent-test',
+          expect.objectContaining({
+            NO_PROXY: expect.stringContaining('api-proxy'),
+          }),
+          '/home/runner/work/repo/repo',
+        );
         expect(mockedSbxManager.execInSandbox).toHaveBeenCalledWith(
           'awf-agent-test',
           'echo hi',
@@ -337,8 +368,10 @@ describe('createMainAction', () => {
           }),
         );
       });
+
     });
   });
+
 
   describe('when runMainWorkflow throws', () => {
     it('calls performCleanup and exits with code 1', async () => {
@@ -350,24 +383,65 @@ describe('createMainAction', () => {
         expect.any(Error)
       );
       expect(mockedDockerManager.cleanup).toHaveBeenCalledWith(
-        STUB_CONFIG.workDir,
+        MAIN_ACTION_STUB_CONFIG.workDir,
         false,
-        STUB_CONFIG.proxyLogsDir,
-        STUB_CONFIG.auditDir,
-        STUB_CONFIG.sessionStateDir,
-        STUB_CONFIG.dockerHostPathPrefix,
-        STUB_CONFIG.imageRegistry,
-        STUB_CONFIG.imageTag,
-        STUB_CONFIG.agentImage,
+        MAIN_ACTION_STUB_CONFIG.proxyLogsDir,
+        MAIN_ACTION_STUB_CONFIG.auditDir,
+        MAIN_ACTION_STUB_CONFIG.sessionStateDir,
+        MAIN_ACTION_STUB_CONFIG.dockerHostPathPrefix,
+        MAIN_ACTION_STUB_CONFIG.imageRegistry,
+        MAIN_ACTION_STUB_CONFIG.imageTag,
+        MAIN_ACTION_STUB_CONFIG.agentImage,
       );
       expect(mockedHostIptables.cleanupHostIptables).not.toHaveBeenCalled();
       expect(processExitSpy).toHaveBeenCalledWith(1);
+    });
+
+    describe('when external runtime resolution fails', () => {
+      it('uses fatal-error cleanup and exits with code 1', async () => {
+        mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockImplementationOnce(() => {
+          throw new Error('backend is not registered');
+        });
+
+        const action = createMainAction(getOptionValueSource);
+        await expect(action(['echo hi'], {})).rejects.toThrow('process.exit: 1');
+
+        expect(mockedLogger.error).toHaveBeenCalledWith(
+          'Fatal error:',
+          expect.objectContaining({ message: 'backend is not registered' }),
+        );
+        expect(mockedDockerManager.cleanup).toHaveBeenCalled();
+        expect(mockedCliWorkflow.runMainWorkflow).not.toHaveBeenCalled();
+        expect(processExitSpy).toHaveBeenCalledWith(1);
+      });
+    });
+
+    describe('when external runtime preflight fails', () => {
+      it('aborts before entering the main workflow', async () => {
+        mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockImplementationOnce(() => ({
+          runtime: 'sbx',
+          preflight: jest.fn().mockRejectedValue(new Error('preflight failed')),
+          start: jest.fn(),
+          exec: jest.fn(),
+          collectDiagnostics: jest.fn(),
+          stop: jest.fn(),
+        }));
+
+        const action = createMainAction(getOptionValueSource);
+        await expect(action(['echo hi'], {})).rejects.toThrow('process.exit: 1');
+
+        expect(mockedCliWorkflow.runMainWorkflow).not.toHaveBeenCalled();
+        expect(mockedLogger.error).toHaveBeenCalledWith(
+          'Fatal error:',
+          expect.objectContaining({ message: 'preflight failed' }),
+        );
+      });
     });
   });
 
   describe('performCleanup with keepContainers=true', () => {
     it('logs preserved paths and skips cleanup when keepContainers is true', async () => {
-      const configWithKeep = { ...STUB_CONFIG, keepContainers: true };
+      const configWithKeep = { ...MAIN_ACTION_STUB_CONFIG, keepContainers: true };
       mockedValidateOptions.validateOptions.mockReturnValue(
         configWithKeep as unknown as import('../types').WrapperConfig
       );
@@ -383,11 +457,111 @@ describe('createMainAction', () => {
         expect.stringContaining('Configuration files preserved')
       );
     });
+
+    it('quiesces an external runtime through its preserve hook', async () => {
+      const preserve = jest.fn().mockResolvedValue(undefined);
+      const backend = {
+        runtime: 'firecracker',
+        preflight: jest.fn(),
+        start: jest.fn(),
+        exec: jest.fn(),
+        collectDiagnostics: jest.fn(),
+        stop: jest.fn(),
+        preserve,
+      };
+      const cleanup = testHelpers.buildCleanupFn(
+        {
+          ...MAIN_ACTION_STUB_CONFIG,
+          keepContainers: true,
+          diagnosticLogs: true,
+        },
+        () => false,
+        () => false,
+        backend,
+      );
+
+      await cleanup();
+
+      expect(backend.collectDiagnostics).toHaveBeenCalledTimes(1);
+      expect(preserve).toHaveBeenCalledTimes(1);
+      expect(backend.stop).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('external runtime cleanup failures', () => {
+    it('continues generic cleanup and then rethrows the runtime failure', async () => {
+      const runtimeError = new Error('Firecracker teardown failed');
+      const backend = {
+        runtime: 'firecracker',
+        preflight: jest.fn(),
+        start: jest.fn(),
+        exec: jest.fn(),
+        collectDiagnostics: jest.fn(),
+        stop: jest.fn().mockRejectedValue(runtimeError),
+      };
+      const cleanup = testHelpers.buildCleanupFn(
+        {
+          ...MAIN_ACTION_STUB_CONFIG,
+          keepContainers: false,
+          diagnosticLogs: true,
+        },
+        () => false,
+        () => false,
+        backend,
+      );
+
+      await expect(cleanup()).rejects.toBe(runtimeError);
+      expect(backend.collectDiagnostics).toHaveBeenCalledTimes(1);
+      expect(mockedDockerManager.cleanup).toHaveBeenCalled();
+      expect(mockedLogger.warn).toHaveBeenCalledWith(
+        'External runtime cleanup failed; continuing with infrastructure teardown.',
+        runtimeError,
+      );
+    });
+  });
+
+  describe('external runtime diagnostics', () => {
+    it('aggregates backend and Docker diagnostics with explicit failures', async () => {
+      const backend = {
+        runtime: 'firecracker',
+        preflight: jest.fn().mockResolvedValue(undefined),
+        start: jest.fn(),
+        exec: jest.fn(),
+        collectDiagnostics: jest.fn().mockResolvedValue(undefined),
+        stop: jest.fn(),
+      };
+      let collectDiagnostics!: (workDir: string) => Promise<void>;
+      mockedExternalRuntimeResolver.resolveExternalRuntimeBackend
+        .mockReturnValueOnce(backend);
+      mockedCliWorkflow.runMainWorkflow.mockImplementationOnce(
+        async (_config, dependencies) => {
+          collectDiagnostics = dependencies.collectDiagnosticLogs!;
+          return 0;
+        },
+      );
+
+      const action = createMainAction(getOptionValueSource);
+      await action(['echo hi'], {});
+      await expect(collectDiagnostics('/tmp/awf')).resolves.toBeUndefined();
+      expect(backend.collectDiagnostics).toHaveBeenCalledTimes(1);
+      expect(mockedDockerManager.collectDiagnosticLogs)
+        .toHaveBeenCalledWith('/tmp/awf');
+
+      backend.collectDiagnostics.mockRejectedValueOnce(
+        new Error('backend diagnostics failed'),
+      );
+      mockedDockerManager.collectDiagnosticLogs.mockRejectedValueOnce(
+        'docker diagnostics failed',
+      );
+      await expect(collectDiagnostics('/tmp/awf')).rejects.toThrow(
+        /backend diagnostics failed; docker diagnostics failed/,
+      );
+    });
   });
 
   describe('performCleanup with containers started', () => {
     it('stops containers and cleans host iptables when both flags are set', async () => {
-      const configWithFlags = { ...STUB_CONFIG, keepContainers: false };
+      const configWithFlags = { ...MAIN_ACTION_STUB_CONFIG, keepContainers: false };
       mockedValidateOptions.validateOptions.mockReturnValue(
         configWithFlags as unknown as import('../types').WrapperConfig
       );
@@ -476,7 +650,7 @@ describe('createMainAction', () => {
   describe('redaction of sensitive config fields', () => {
     it('does not log API keys in debug output', async () => {
       const configWithKeys = {
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         openaiApiKey: 'sk-secret',
         anthropicApiKey: 'ant-secret',
         copilotGithubToken: 'ghp-secret',
@@ -516,7 +690,7 @@ describe('createMainAction', () => {
 
     it('writes awf-resolved-config.json to audit dir when set', async () => {
       const configWithAudit = {
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         auditDir: '/tmp/awf-audit',
       };
       mockedValidateOptions.validateOptions.mockReturnValue(
@@ -544,7 +718,7 @@ describe('createMainAction', () => {
     it('redacts secret values in agentCommand in the artifact', async () => {
       const secretValue = 'super-secret-token-12345';
       const configWithSecret = {
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         auditDir: '/tmp/awf-audit',
         agentCommand: `my-agent --token ${secretValue}`,
       };
@@ -569,7 +743,7 @@ describe('createMainAction', () => {
     });
 
     it('falls back to workDir/audit when auditDir is not set', async () => {
-      mockedValidateOptions.validateOptions.mockReturnValue(STUB_CONFIG);
+      mockedValidateOptions.validateOptions.mockReturnValue(MAIN_ACTION_STUB_CONFIG);
       const action = createMainAction(getOptionValueSource);
       await action(['echo hi'], {});
 
@@ -589,7 +763,7 @@ describe('createMainAction', () => {
     it('redactConfigForLogging removes sensitive keys and redacts agentCommand', () => {
       const secretValue = 'secret-123';
       const configWithSecrets = {
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         agentCommand: `agent --token ${secretValue}`,
         openaiApiKey: 'sk-secret',
       } as unknown as import('../types').WrapperConfig;
@@ -606,7 +780,7 @@ describe('createMainAction', () => {
 
     it('redactConfigForLogging redacts additionalEnv object values', () => {
       const redacted = testHelpers.redactConfigForLogging({
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         additionalEnv: { ANTHROPIC_API_KEY: 'sk-real', GH_TOKEN: 'token123' },
       } as unknown as import('../types').WrapperConfig);
 
@@ -618,7 +792,7 @@ describe('createMainAction', () => {
 
     it('redactConfigForLogging preserves null additionalEnv', () => {
       const redacted = testHelpers.redactConfigForLogging({
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         additionalEnv: null as unknown as Record<string, string>,
       } as unknown as import('../types').WrapperConfig);
 
@@ -627,7 +801,7 @@ describe('createMainAction', () => {
 
     it('redactConfigForLogging preserves non-object additionalEnv values', () => {
       const redacted = testHelpers.redactConfigForLogging({
-        ...STUB_CONFIG,
+        ...MAIN_ACTION_STUB_CONFIG,
         additionalEnv: 'raw-env-string' as unknown as Record<string, string>,
       } as unknown as import('../types').WrapperConfig);
 
@@ -639,7 +813,7 @@ describe('createMainAction', () => {
         throw new Error('write failed');
       });
 
-      testHelpers.persistConfigAuditArtifact(STUB_CONFIG, { foo: 'bar' });
+      testHelpers.persistConfigAuditArtifact(MAIN_ACTION_STUB_CONFIG, { foo: 'bar' });
 
       expect(mockedLogger.debug).toHaveBeenCalledWith(
         expect.stringContaining('Failed to write resolved config artifact:')
@@ -648,7 +822,7 @@ describe('createMainAction', () => {
 
     it('buildCleanupFn runs cleanup using provided state getters', async () => {
       const performCleanup = testHelpers.buildCleanupFn(
-        STUB_CONFIG,
+        MAIN_ACTION_STUB_CONFIG,
         () => true,
         () => true,
       );
@@ -656,15 +830,43 @@ describe('createMainAction', () => {
       await performCleanup();
 
       expect(mockedDockerManager.preserveIptablesAudit).toHaveBeenCalledWith(
-        STUB_CONFIG.workDir,
-        STUB_CONFIG.auditDir
+        MAIN_ACTION_STUB_CONFIG.workDir,
+        MAIN_ACTION_STUB_CONFIG.auditDir
+      );
+      expect(mockedEnclaveGateway.shutdownEnclaveGateway).toHaveBeenCalledWith(
+        MAIN_ACTION_STUB_CONFIG
+      );
+      expect(
+        mockedEnclaveGateway.shutdownEnclaveGateway.mock.invocationCallOrder[0]
+      ).toBeLessThan(
+        mockedDockerManager.preserveIptablesAudit.mock.invocationCallOrder[0]
       );
       expect(mockedDockerManager.stopContainers).toHaveBeenCalledWith(
-        STUB_CONFIG.workDir,
-        STUB_CONFIG.keepContainers
+        MAIN_ACTION_STUB_CONFIG.workDir,
+        MAIN_ACTION_STUB_CONFIG.keepContainers
       );
       expect(mockedHostIptables.cleanupHostIptables).toHaveBeenCalled();
       expect(mockedDockerManager.cleanup).toHaveBeenCalled();
+    });
+
+    it('preserves audits after an enclave drain failure', async () => {
+      mockedEnclaveGateway.shutdownEnclaveGateway.mockRejectedValueOnce(
+        new Error('drain failed')
+      );
+      const performCleanup = testHelpers.buildCleanupFn(
+        MAIN_ACTION_STUB_CONFIG,
+        () => true,
+        () => false,
+      );
+
+      await performCleanup();
+
+      expect(mockedLogger.warn).toHaveBeenCalledWith(
+        'Enclave gateway did not complete graceful shutdown; preserved enclave audit is marked incomplete.',
+        expect.any(Error)
+      );
+      expect(mockedDockerManager.preserveIptablesAudit).toHaveBeenCalled();
+      expect(mockedDockerManager.stopContainers).toHaveBeenCalled();
     });
   });
 });

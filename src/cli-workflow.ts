@@ -3,26 +3,29 @@ import { HostAccessConfig, CliProxyHostConfig } from './host-iptables';
 import { DEFAULT_DNS_SERVERS } from './dns-resolver';
 import { parseDifcProxyHost } from './docker-manager';
 import { CLI_PROXY_IP, DOH_PROXY_IP, SQUID_IP, API_PROXY_IP } from './host-iptables-shared';
+import { buildInternalServiceHosts } from './services/internal-service-hosts';
 import { TOPOLOGY_NETWORK_NAME, getTopologyContainerIps, patchComposeWithTopologyHosts } from './topology';
-import { runtimeNeedsStaticDns } from './container-runtime';
+import { validateEnclavesConfig } from './enclave/preflight';
 
 /**
  * Dependencies injected into the main workflow.
  *
- * These are implemented by `docker-manager.ts` for the Docker Compose backend.
- * A future microVM backend (e.g. Docker sbx) would provide alternative
- * implementations that:
- * - `writeConfigs` — generate compose for infrastructure only (no agent service)
- * - `startContainers` — start Squid + api-proxy via compose, then launch agent
- *   in a microVM with the sbx proxy chaining through host-side Squid/api-proxy
- * - `runAgentCommand` — `sbx run` instead of `docker logs -f` + `docker wait`
- * - Cleanup — `sbx rm` + `docker compose down` for infrastructure
+ * These are implemented by `docker-manager.ts` for Docker Compose agents.
+ * External agent backends adapt their lifecycle to `startContainers` and
+ * `runAgentCommand` while continuing to use compose for infrastructure.
  */
-interface WorkflowDependencies {
+export interface WorkflowDependencies {
   ensureFirewallNetwork: () => Promise<{ squidIp: string; agentIp: string; proxyIp: string; subnet: string }>;
   setupHostIptables: (squidIp: string, port: number, dnsServers: string[], apiProxyIp?: string, dohProxyIp?: string, hostAccess?: HostAccessConfig, cliProxyConfig?: CliProxyHostConfig) => Promise<void>;
   writeConfigs: (config: WrapperConfig) => Promise<void>;
-  startContainers: (workDir: string, allowedDomains: string[], proxyLogsDir?: string, skipPull?: boolean, onNetworkReady?: () => Promise<void>) => Promise<void>;
+  startContainers: (
+    workDir: string,
+    allowedDomains: string[],
+    proxyLogsDir?: string,
+    skipPull?: boolean,
+    onNetworkReady?: () => Promise<void>,
+    onInfrastructureReady?: () => Promise<void>,
+  ) => Promise<void>;
   runAgentCommand: (
     workDir: string,
     allowedDomains: string[],
@@ -30,6 +33,8 @@ interface WorkflowDependencies {
     agentTimeoutMinutes?: number
   ) => Promise<{ exitCode: number }>;
   collectDiagnosticLogs?: (workDir: string) => Promise<void>;
+  /** Trusted unified enclave preflight and staging. */
+  prepareEnclaves?: (config: WrapperConfig) => Promise<void>;
   /**
    * Fail-stop preflight for network-isolation mode. Aborts (process exit) when
    * topology enforcement cannot be supported on the current platform.
@@ -40,6 +45,10 @@ interface WorkflowDependencies {
    * network after the AWF containers have started.
    */
   connectTopologyContainers?: (networkName: string, containerNames: string[]) => Promise<void>;
+  /** Attaches and verifies the externally owned gateway on the private enclave control path. */
+  connectEnclaveGateway?: (config: WrapperConfig) => Promise<void>;
+  /** Proves initialize and the exact enabled tool contracts through mcpg. */
+  assertEnclaveGatewayReady?: (config: WrapperConfig) => Promise<void>;
 }
 
 interface WorkflowCallbacks {
@@ -68,6 +77,27 @@ export async function runMainWorkflow(
   options: WorkflowOptions
 ): Promise<number> {
   const { logger, performCleanup, onHostIptablesSetup, onContainersStarted } = options;
+
+  const enclaveErrors = validateEnclavesConfig(config);
+  if (enclaveErrors.length > 0) {
+    throw new Error(`Invalid enclave configuration:\n- ${enclaveErrors.join('\n- ')}`);
+  }
+
+  // Step -1: Enclave staging (trusted, host-side, credential-bearing).
+  //
+  // Runs first so that:
+  //  - a staging failure aborts before any container is created;
+  //  - the staging credential is gone before the broker, the agent, or any
+  //    probe exists;
+  //  - compose generation (Step 1) can rely on the private seed layout
+  //    already being present on disk.
+  if (config.enclaves?.enabled) {
+    if (!dependencies.prepareEnclaves) {
+      throw new Error('Enclaves are enabled but no staging implementation was provided to runMainWorkflow');
+    }
+    logger.info('Staging enclave repository seeds...');
+    await dependencies.prepareEnclaves(config);
+  }
 
   // Step 0: Setup host-level network and iptables
   //
@@ -133,18 +163,34 @@ export async function runMainWorkflow(
           logger.info(`Attaching ${config.topologyAttach!.length} trusted container(s) to the internal network...`);
           await dependencies.connectTopologyContainers!(TOPOLOGY_NETWORK_NAME, config.topologyAttach!);
 
-          // When the agent uses a runtime whose network stack cannot reach
-          // Docker's embedded DNS (e.g. gVisor), inject /etc/hosts entries for
-          // topology peers and compose-internal services so hostname resolution
-          // works without DNS.
-          if (runtimeNeedsStaticDns(config.containerRuntime)) {
+          // Docker's embedded DNS (127.0.0.11) is not always reachable from
+          // inside the sandbox: gVisor's userspace netstack cannot reach it,
+          // and on ARC/DinD runners the Docker-in-Docker network does not
+          // forward lookups to the Kubernetes cluster resolver — which is what
+          // produces "getaddrinfo EAI_AGAIN <peer>" failures.
+          //
+          // Every peer we might resolve here is known in advance with a fixed
+          // IP: the topology peers (e.g. the MCP gateway) are discovered via
+          // `getTopologyContainerIps`, and the compose-internal proxies have
+          // static IPs. So we always pre-register them in /etc/hosts whenever
+          // network isolation is active. This is a no-op when embedded DNS
+          // works (the entries match what DNS would return) and prevents the
+          // DNS-isolation failure when it does not — turning a diagnosis into a
+          // fix. Previously this ran only for gVisor; ARC/DinD needs it too.
+          {
             const peerIps = await getTopologyContainerIps(TOPOLOGY_NETWORK_NAME, config.topologyAttach!);
 
             // Include compose-internal services whose hostnames the agent may
             // need to resolve — normally handled by Docker DNS at 127.0.0.11.
-            peerIps.set('squid-proxy', SQUID_IP);
-            if (config.enableApiProxy) {
-              peerIps.set('api-proxy', API_PROXY_IP);
+            // Uses the same service→name mapping as the gVisor compose path
+            // (buildInternalServiceHosts); the topology path sources the fixed
+            // sidecar IPs from constants since it has no host networkConfig.
+            for (const [name, ip] of Object.entries(buildInternalServiceHosts({
+              squidIp: SQUID_IP,
+              apiProxyIp: config.enableApiProxy ? API_PROXY_IP : undefined,
+              cliProxyIp: config.difcProxyHost ? CLI_PROXY_IP : undefined,
+            }))) {
+              peerIps.set(name, ip);
             }
 
             if (peerIps.size > 0) {
@@ -154,8 +200,27 @@ export async function runMainWorkflow(
         }
       : undefined;
 
+  const onInfrastructureReady = config.enclaves?.enabled
+    ? async () => {
+        if (!dependencies.connectEnclaveGateway || !dependencies.assertEnclaveGatewayReady) {
+          throw new Error('Enclaves require an exclusive MCP gateway readiness implementation');
+        }
+        logger.info('Attaching the trusted MCP gateway to the private enclave control path...');
+        await dependencies.connectEnclaveGateway(config);
+        logger.info('Proving enclave tools end to end through the MCP gateway...');
+        await dependencies.assertEnclaveGatewayReady(config);
+      }
+    : undefined;
+
   try {
-    await dependencies.startContainers(config.workDir, config.allowedDomains, config.proxyLogsDir, config.skipPull, onNetworkReady);
+    await dependencies.startContainers(
+      config.workDir,
+      config.allowedDomains,
+      config.proxyLogsDir,
+      config.skipPull,
+      onNetworkReady,
+      onInfrastructureReady,
+    );
   } catch (startError) {
     // Signal that containers may have been partially created so the caller's
     // cleanup (stopContainers / docker compose down -v) will tear them down

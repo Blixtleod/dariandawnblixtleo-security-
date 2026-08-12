@@ -9,8 +9,12 @@ export const IPTABLES_INIT_CONTAINER_NAME = 'awf-iptables-init';
 export const API_PROXY_CONTAINER_NAME = 'awf-api-proxy';
 export const DOH_PROXY_CONTAINER_NAME = 'awf-doh-proxy';
 export const CLI_PROXY_CONTAINER_NAME = 'awf-cli-proxy';
+export const ENCLAVE_MCP_SERVER_CONTAINER_NAME = 'awf-enclave-mcp-server';
+export const ENCLAVE_AGENT_API_PROXY_CONTAINER_NAME = 'awf-enclave-agent-api-proxy';
 
-export const SQUID_PORT = 3128;
+// SQUID_PORT is centralized in src/config/sandbox-network-policy.json and
+// re-exported here so existing import sites keep working unchanged.
+export { SQUID_PORT } from './config/network-policy';
 
 /**
  * Maximum size (bytes) of a single environment variable value allowed through

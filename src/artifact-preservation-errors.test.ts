@@ -41,6 +41,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { fixArtifactPermissionsForRootless } from './artifact-permissions';
+import { logger } from './logger';
 import { mockExecaSync } from './test-helpers/mock-execa.test-utils';
 import {
   preserveIptablesAudit,
@@ -125,21 +126,56 @@ describe('artifact-preservation – error paths', () => {
       }
     });
 
-    it('does not throw when runtimeDir chmod fails (line 62)', () => {
+    it('keeps the primary failure as the last visible diagnostic when runtimeDir chmod is denied', () => {
       // proxyLogsDir squid-logs uses runtimeDirMustExist:false → chmod always called.
       // With no api-proxy-logs or cli-proxy-logs subdirs, squid-logs chmod is first.
       const externalDir = makeTempDir();
       const workDir = makeTempDir();
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       try {
         const proxyLogsDir = path.join(externalDir, 'proxy-logs');
         realFs.mkdirSync(proxyLogsDir);
 
         mockExecaSync.mockImplementationOnce(() => {
-          throw new Error('chmod: operation not permitted');
+          throw Object.assign(new Error('Command failed with exit code 1: chmod -R a+rX'), {
+            stderr: `chmod: changing permissions of '${proxyLogsDir}': Operation not permitted`,
+            exitCode: 1,
+          });
         });
 
+        logger.error('Fatal error: primary topology startup failure');
         expect(() => preserveCleanupArtifacts(workDir, { proxyLogsDir })).not.toThrow();
+        expect(errorSpy.mock.calls[errorSpy.mock.calls.length - 1]?.[0]).toEqual(
+          expect.stringContaining('[ERROR] Fatal error: primary topology startup failure'),
+        );
+        expect(errorSpy.mock.calls.flat().join('\n')).not.toContain(
+          'Could not fix squid log permissions',
+        );
       } finally {
+        errorSpy.mockRestore();
+        realFs.rmSync(externalDir, { recursive: true, force: true });
+        realFs.rmSync(workDir, { recursive: true, force: true });
+      }
+    });
+
+    it('warns when runtimeDir chmod fails unexpectedly', () => {
+      const externalDir = makeTempDir();
+      const workDir = makeTempDir();
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const proxyLogsDir = path.join(externalDir, 'proxy-logs');
+        realFs.mkdirSync(proxyLogsDir);
+        mockExecaSync.mockImplementationOnce(() => {
+          throw new Error('chmod: input/output error');
+        });
+
+        preserveCleanupArtifacts(workDir, { proxyLogsDir });
+
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain(
+          '[WARN] Could not fix squid log permissions:',
+        );
+      } finally {
+        errorSpy.mockRestore();
         realFs.rmSync(externalDir, { recursive: true, force: true });
         realFs.rmSync(workDir, { recursive: true, force: true });
       }
@@ -180,6 +216,33 @@ describe('artifact-preservation – error paths', () => {
       }
     });
 
+    it('keeps the primary failure as the last visible diagnostic when auditDir chmod is denied', () => {
+      const auditDir = makeTempDir('awf-audit-');
+      const workDir = makeTempDir();
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        getuidSpy = jest.spyOn(process, 'getuid').mockReturnValue(0);
+        mockExecaSync.mockImplementationOnce(() => {
+          throw Object.assign(new Error('Command failed with EACCES: chmod -R a+rX'), {
+            code: 'EACCES',
+          });
+        });
+
+        logger.error('Fatal error: primary topology startup failure');
+        expect(() => preserveCleanupArtifacts(workDir, { auditDir })).not.toThrow();
+        expect(errorSpy.mock.calls[errorSpy.mock.calls.length - 1]?.[0]).toEqual(
+          expect.stringContaining('[ERROR] Fatal error: primary topology startup failure'),
+        );
+        expect(errorSpy.mock.calls.flat().join('\n')).not.toContain(
+          'Could not fix audit dir permissions as non-root user',
+        );
+      } finally {
+        errorSpy.mockRestore();
+        realFs.rmSync(auditDir, { recursive: true, force: true });
+        realFs.rmSync(workDir, { recursive: true, force: true });
+      }
+    });
+
     it('runs rootless permission repair with translated mount paths', () => {
       const auditDir = makeTempDir('awf-audit-');
       const workDir = makeTempDir();
@@ -198,9 +261,13 @@ describe('artifact-preservation – error paths', () => {
             'run',
             '--pull',
             'never',
+            '--entrypoint',
+            'sh',
             '-v',
             `/host${path.resolve(auditDir)}:/fix:rw`,
             'ghcr.io/github/gh-aw-firewall/agent:latest',
+            '-c',
+            'chown -R "$TUID:$TGID" /fix 2>/dev/null; chmod -R a+rwX /fix',
           ]),
           expect.objectContaining({ reject: false }),
         );

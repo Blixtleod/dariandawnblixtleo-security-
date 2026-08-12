@@ -8,7 +8,7 @@ const copilotSmokeWorkflows = [
   { name: 'smoke-copilot-byok-aoai-entra', file: 'smoke-copilot-byok-aoai-entra.md' },
   { name: 'smoke-copilot-byok', file: 'smoke-copilot-byok.md' },
   { name: 'smoke-copilot', file: 'smoke-copilot.md' },
-  { name: 'smoke-copilot-pat', file: 'smoke-copilot-pat.md' },
+  { name: 'smoke-copilot-network-isolation', file: 'smoke-copilot-network-isolation.md' },
 ];
 
 describe('smoke copilot workflow output requirements', () => {

@@ -44,6 +44,7 @@ Once the workflow completes:
    - Linux arm64 binary (`awf-linux-arm64`)
    - NPM tarball (`awf.tgz`)
    - Checksums file (`checksums.txt`)
+   - Container digest manifest (`containers.txt`)
    - JSON Schema files (`awf-config.schema.json`, `audit.schema.json`, `token-usage.schema.json`)
    - Installation instructions with GHCR image references
 3. Go to **Packages** page (in repository)
@@ -53,6 +54,9 @@ Once the workflow completes:
    - `api-proxy:<version>` and `api-proxy:latest`
    - `cli-proxy:<version>` and `cli-proxy:latest`
    - `agent-act:<version>` and `agent-act:latest` (GitHub Actions parity image)
+   - `enclave-script:<version>` and `enclave-script:latest`
+   - `enclave-agent:<version>` and `enclave-agent:latest`
+   - `enclave-mcp-server:<version>` and `enclave-mcp-server:latest`
 
 ## Release Artifacts
 
@@ -63,6 +67,7 @@ Each release includes:
 - `awf-linux-arm64` - Linux arm64 standalone executable
 - `awf.tgz` - NPM package tarball (alternative installation method)
 - `checksums.txt` - SHA256 checksums for all files
+- `containers.txt` - Digest-pinned container manifest for published runtime images
 - `awf-config.schema.json` - AWF config JSON Schema
 - `awf-config.v1.schema.json` - **Deprecated alias** of `awf-config.schema.json` (kept for backward compatibility)
 - `audit.schema.json` - AWF audit JSONL record JSON Schema
@@ -99,10 +104,36 @@ Docker images are published to `ghcr.io/github/gh-aw-firewall`:
 - `api-proxy:<version>` and `api-proxy:latest` - API proxy sidecar for credential isolation
 - `cli-proxy:<version>` and `cli-proxy:latest` - CLI proxy sidecar for gh CLI access via mcpg DIFC proxy
 - `agent-act:<version>` and `agent-act:latest` - Agent with GitHub Actions parity (~2GB)
+- `enclave-script:<version>` and `enclave-script:latest` - No-network script executor, built from `containers/enclave/Dockerfile` target `enclave-script`
+- `enclave-agent:<version>` and `enclave-agent:latest` - Single-use agent executor, built from `containers/enclave/Dockerfile` target `enclave-agent`
+- `enclave-mcp-server:<version>` and `enclave-mcp-server:latest` - Shared enclave MCP server, built from `containers/enclave/Dockerfile` target `enclave-mcp-server`
 
 These images are automatically pulled by the CLI when running commands.
 
 The `agent-act` image is used when running with `--agent-image act` for workflows that need closer parity with GitHub Actions runner environments.
+
+### Firecracker preview test artifacts
+
+The main release workflow builds, attests, and publishes the versioned
+`firecracker-test-x86_64` preview bundle as GitHub Release assets. Pull request
+and manual validation through `test-firecracker.yml` also uploads the unpacked
+artifact set with **7-day workflow-artifact retention**.
+
+These artifacts are:
+
+- **x86_64 only** — no aarch64 test artifact is published.
+- **Preview / testing purpose only** — `manifest.json` inside the tarball states:
+  `"purpose": "AWF Firecracker preview test artifacts; not production defaults"`.
+- **Not auto-downloaded** — there is no mechanism in AWF to fetch them
+  automatically; operators must download, verify, and supply them explicitly.
+- **Not a production default** — operators who want to evaluate Firecracker for
+  production must obtain, verify, and manage their own guest kernel and rootfs
+  appropriate to their workload security requirements.
+- **Explicitly verified** — `firecracker-test-x86_64.SHA256SUMS` covers the five
+  files inside the tarball; extract the tarball before running `sha256sum -c`.
+
+See [Firecracker integration (preview) — Artifact policy](./firecracker-integration.md#part-5--artifact-policy)
+for the complete artifact specification and digest requirements.
 
 ## Testing a Release Locally
 

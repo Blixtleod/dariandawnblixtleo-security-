@@ -3,7 +3,19 @@ import * as path from 'path';
 import * as os from 'os';
 import execa from 'execa';
 import { logger } from './logger';
-import { fixArtifactPermissionsForRootless } from './artifact-permissions';
+import {
+  fixArtifactPermissionsForRootless,
+  isBenignArtifactPermissionError,
+} from './artifact-permissions';
+import { getLocalDockerEnv } from './host-env';
+import { resolveEnclavePaths } from './enclave/paths';
+import { ENCLAVE_MCP_SERVER_CONTAINER_NAME } from './constants';
+
+const ENCLAVE_SESSION_DIR = 'sessions';
+const ENCLAVE_AUDIT_FILES = [
+  { source: 'enclave.jsonl', destination: 'enclave.jsonl' },
+  { source: 'runtime-telemetry.jsonl', destination: 'enclave-runtime.jsonl' },
+] as const;
 
 /**
  * Copies the iptables audit dump from the init-signal volume to the audit directory.
@@ -12,14 +24,57 @@ import { fixArtifactPermissionsForRootless } from './artifact-permissions';
  */
 export function preserveIptablesAudit(workDir: string, auditDir?: string): void {
   const iptablesAuditSrc = path.join(workDir, 'init-signal', 'iptables-audit.txt');
+  const enclaveRoot = resolveEnclavePaths(workDir).root;
   const targetAuditDir = auditDir || path.join(workDir, 'audit');
-  if (fs.existsSync(iptablesAuditSrc) && fs.existsSync(targetAuditDir)) {
+  if (!fs.existsSync(targetAuditDir)) return;
+
+  if (fs.existsSync(iptablesAuditSrc)) {
     try {
       fs.copyFileSync(iptablesAuditSrc, path.join(targetAuditDir, 'iptables-audit.txt'));
       fs.chmodSync(path.join(targetAuditDir, 'iptables-audit.txt'), 0o644);
       logger.debug('Copied iptables audit state to audit directory');
     } catch (error) {
       logger.debug('Could not copy iptables audit file:', error);
+    }
+  }
+
+  if (fs.existsSync(enclaveRoot)) {
+    for (const auditFile of ENCLAVE_AUDIT_FILES) {
+      try {
+        const source = `${ENCLAVE_MCP_SERVER_CONTAINER_NAME}:/var/log/awf-enclave/${auditFile.source}`;
+        const destination = path.join(targetAuditDir, auditFile.destination);
+        const result = execa.sync(
+          'docker',
+          ['cp', source, destination],
+          { env: getLocalDockerEnv(), reject: false },
+        );
+        if (result.exitCode === 0) {
+          logger.debug(`Copied enclave MCP server ${auditFile.source} to audit directory`);
+        } else {
+          logger.debug(`Could not copy enclave ${auditFile.source}:`, result.stderr);
+        }
+      } catch (error) {
+        logger.debug(`Could not copy enclave ${auditFile.source}:`, error);
+      }
+    }
+    try {
+      const destination = path.join(targetAuditDir, 'enclave-agent-sessions');
+      const result = execa.sync(
+        'docker',
+        [
+          'cp',
+          `${ENCLAVE_MCP_SERVER_CONTAINER_NAME}:/var/log/awf-enclave/${ENCLAVE_SESSION_DIR}`,
+          destination,
+        ],
+        { env: getLocalDockerEnv(), reject: false },
+      );
+      if (result.exitCode === 0) {
+        logger.debug('Copied enclave agent sessions to audit directory');
+      } else {
+        logger.debug('Could not copy enclave agent sessions:', result.stderr);
+      }
+    } catch (error) {
+      logger.debug('Could not copy enclave agent sessions:', error);
     }
   }
 }
@@ -36,7 +91,6 @@ type PreserveDirectoryOptions = {
   permissionErrorMessage: string;
   preserveErrorMessage: string;
   chmodPreservedDir?: boolean;
-  runtimeDirMustExist?: boolean;
 };
 
 function preserveDirectory({
@@ -51,16 +105,22 @@ function preserveDirectory({
   permissionErrorMessage,
   preserveErrorMessage,
   chmodPreservedDir = false,
-  runtimeDirMustExist = true,
 }: PreserveDirectoryOptions): void {
   if (runtimeDir) {
     const targetDir = runtimeSubdir ? path.join(runtimeDir, runtimeSubdir) : runtimeDir;
-    if (!runtimeDirMustExist || fs.existsSync(targetDir)) {
+    if (fs.existsSync(targetDir)) {
       try {
         execa.sync('chmod', ['-R', 'a+rX', targetDir]);
         logger.info(`${availableLabel} available at: ${targetDir}`);
       } catch (error) {
-        logger.warn(permissionErrorMessage, error);
+        if (isBenignArtifactPermissionError(error)) {
+          logger.debug(
+            `${permissionErrorMessage} Permission repair was denied for ${targetDir}; ` +
+              'this is expected on restricted runners and does not affect the run.',
+          );
+        } else {
+          logger.warn(permissionErrorMessage, error);
+        }
       }
     }
     return;
@@ -156,7 +216,6 @@ export function preserveCleanupArtifacts(
     permissionErrorMessage: 'Could not fix squid log permissions:',
     preserveErrorMessage: 'Could not preserve squid logs:',
     chmodPreservedDir: true,
-    runtimeDirMustExist: false,
   });
 
   if (auditDir) {
@@ -165,7 +224,14 @@ export function preserveCleanupArtifacts(
         execa.sync('chmod', ['-R', 'a+rX', auditDir]);
         logger.info(`Audit artifacts available at: ${auditDir}`);
       } catch (error) {
-        logger.warn('Could not fix audit dir permissions as non-root user; rootless repair will be attempted:', error);
+        if (isBenignArtifactPermissionError(error)) {
+          logger.debug(
+            `Could not fix audit dir permissions as non-root user. Permission repair was denied for ${auditDir}; ` +
+              'this is expected on restricted runners and rootless repair will be attempted.',
+          );
+        } else {
+          logger.warn('Could not fix audit dir permissions as non-root user; rootless repair will be attempted:', error);
+        }
       }
     }
   } else {

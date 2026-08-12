@@ -135,6 +135,34 @@ describe('buildProviderRoutingEnv', () => {
     const env = buildProviderRoutingEnv({ ...baseConfig, workDir: '/tmp/awf-test' });
     expect(env.AWF_API_PROXY_SHUTDOWN_TIMEOUT_MS).toBe('8000');
   });
+
+  it('forwards OPENAI_ENDPOINT_OVERRIDE from process.env when set', () => {
+    const saved = process.env.OPENAI_ENDPOINT_OVERRIDE;
+    process.env.OPENAI_ENDPOINT_OVERRIDE = '  https://secret-router.example.com/internal/path  ';
+    try {
+      const env = buildProviderRoutingEnv({ ...baseConfig, workDir: '/tmp/awf-test' });
+      expect(env.OPENAI_ENDPOINT_OVERRIDE).toBe('https://secret-router.example.com/internal/path');
+    } finally {
+      if (saved !== undefined) process.env.OPENAI_ENDPOINT_OVERRIDE = saved;
+      else delete process.env.OPENAI_ENDPOINT_OVERRIDE;
+    }
+  });
+
+  it('prefers OPENAI_ENDPOINT_OVERRIDE from additionalEnv over process.env', () => {
+    const saved = process.env.OPENAI_ENDPOINT_OVERRIDE;
+    process.env.OPENAI_ENDPOINT_OVERRIDE = 'https://process-env-router.example.com';
+    try {
+      const env = buildProviderRoutingEnv({
+        ...baseConfig,
+        workDir: '/tmp/awf-test',
+        additionalEnv: { OPENAI_ENDPOINT_OVERRIDE: 'https://additional-env-router.example.com' },
+      });
+      expect(env.OPENAI_ENDPOINT_OVERRIDE).toBe('https://additional-env-router.example.com');
+    } finally {
+      if (saved !== undefined) process.env.OPENAI_ENDPOINT_OVERRIDE = saved;
+      else delete process.env.OPENAI_ENDPOINT_OVERRIDE;
+    }
+  });
 });
 
 describe('resolveApiProxyShutdownTimeoutMs', () => {
@@ -183,6 +211,9 @@ describe('buildOtelEnv', () => {
     'OTEL_EXPORTER_OTLP_HEADERS',
     'GITHUB_AW_OTEL_TRACE_ID',
     'GITHUB_AW_OTEL_PARENT_SPAN_ID',
+    'GH_AW_OTLP_WORKLOAD_IDENTITY',
+    'ACTIONS_ID_TOKEN_REQUEST_URL',
+    'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
     'OTEL_SERVICE_NAME',
   ];
 
@@ -216,6 +247,24 @@ describe('buildOtelEnv', () => {
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'https://otel.example.com';
     const env = buildOtelEnv();
     expect(env.OTEL_EXPORTER_OTLP_ENDPOINT).toBe('https://otel.example.com');
+  });
+
+  it('forwards GH_AW_OTLP_ENDPOINTS when set', () => {
+    process.env.GH_AW_OTLP_ENDPOINTS = '[{"url":"https://otel.example.com"}]';
+    const env = buildOtelEnv();
+    expect(env.GH_AW_OTLP_ENDPOINTS).toBe('[{"url":"https://otel.example.com"}]');
+  });
+
+  it('forwards workload identity and GitHub OIDC runtime credentials together', () => {
+    process.env.GH_AW_OTLP_WORKLOAD_IDENTITY = '{"provider":"gcp","audience":"projects/123/providers/github"}';
+    process.env.ACTIONS_ID_TOKEN_REQUEST_URL = 'https://actions.example/oidc';
+    process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'runtime-token';
+
+    const env = buildOtelEnv();
+
+    expect(env.GH_AW_OTLP_WORKLOAD_IDENTITY).toBe(process.env.GH_AW_OTLP_WORKLOAD_IDENTITY);
+    expect(env.ACTIONS_ID_TOKEN_REQUEST_URL).toBe('https://actions.example/oidc');
+    expect(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN).toBe('runtime-token');
   });
 
   it('forwards GITHUB_AW_OTEL_TRACE_ID and GITHUB_AW_OTEL_PARENT_SPAN_ID when set', () => {
@@ -261,6 +310,18 @@ describe('buildRateLimitEnv', () => {
   it('sets AWF_MAX_AI_CREDITS when configured', () => {
     const env = buildRateLimitEnv({ ...baseConfig, workDir: '/tmp/awf-test', maxAiCredits: 1.25 });
     expect(env.AWF_MAX_AI_CREDITS).toBe('1.25');
+  });
+
+  it('sets AWF_API_PROXY_PROVIDERS when provider pricing overlays are configured', () => {
+    const providers = {
+      anthropic: {
+        models: {
+          'custom-model': { cost: { input: '3e-06', output: '1.5e-05' } },
+        },
+      },
+    };
+    const env = buildRateLimitEnv({ ...baseConfig, workDir: '/tmp/awf-test', apiProxyProviders: providers });
+    expect(JSON.parse(env.AWF_API_PROXY_PROVIDERS)).toEqual(providers);
   });
 
   it('sets AWF_MAX_RUNS when configured', () => {

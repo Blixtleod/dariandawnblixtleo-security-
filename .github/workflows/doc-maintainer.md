@@ -1,13 +1,14 @@
 ---
-description: Daily documentation review with a 7-day change gate and 48-hour agent context
+description: Weekly documentation review with a 7-day change gate and 48-hour agent context
 on:
-  schedule: daily
+  schedule: weekly
   workflow_dispatch:
   skip-if-match:
     query: 'is:pr is:open in:title "[docs]"'
     max: 1
 permissions:
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 sandbox:
@@ -25,7 +26,7 @@ jobs:
       skip_agent: ${{ steps.check.outputs.skip_agent }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: Check for relevant changes
@@ -50,10 +51,10 @@ jobs:
             echo "has_changes=$HAS_CHANGES"
             echo "skip_agent=$SKIP_AGENT"
           } >> "$GITHUB_OUTPUT"
-max-turns: 15
+max-turns: 30
+model: claude-haiku-4.5
 engine:
   id: copilot
-  model: claude-haiku-4.5
 tools:
   edit:
   bash: false

@@ -19,11 +19,13 @@ const {
   parseModelFallbackConfig,
   makeModelBodyTransform: makeModelBodyTransformForProvider,
   filterResolvableAliases,
+  filterAvailableModelsToConfiguredProviders,
   getEffectiveModelFallbackForReflect,
 } = require('./model-config');
 const {
   keyValidationResults,
   cachedModels,
+  getRuntimeCatalogSnapshot,
   configureKeyValidation,
   resetKeyValidationState,
   resetModelCacheState,
@@ -97,8 +99,29 @@ if (!HTTPS_PROXY) {
 
 const { createAllAdapters } = require('./providers');
 
+/**
+ * Model cache keys of the provider slots that are actually configured for this
+ * run. Alias resolution must never steer a request to a provider that reports
+ * `configured: false` — every such call fails with `provider_not_configured`.
+ */
+function getConfiguredModelCacheKeys(adapters = registeredAdapters) {
+  const keys = new Set();
+  for (const adapter of adapters) {
+    const reflection = adapter.getReflectionInfo();
+    if (!reflection.configured) continue;
+    const cacheKey = reflection.models_cache_key;
+    if (cacheKey) keys.add(cacheKey);
+  }
+  return keys;
+}
+
 function makeModelBodyTransform(provider) {
-  return makeModelBodyTransformForProvider(provider, cachedModels, refreshProviderModelsForResolution);
+  return makeModelBodyTransformForProvider(
+    provider,
+    cachedModels,
+    refreshProviderModelsForResolution,
+    getConfiguredModelCacheKeys,
+  );
 }
 
 const registeredAdapters = createAllAdapters(process.env, {
@@ -116,13 +139,21 @@ configureKeyValidation({
 const { healthResponse, reflectEndpoints, handleManagementEndpoint } = createManagementHandlers({
   getAdapters: () => registeredAdapters,
   getCachedModels: () => cachedModels,
+  getRuntimeModelMetadata: () => getRuntimeCatalogSnapshot(),
   isModelFetchComplete: () => isModelFetchComplete(),
   getKeyValidationState: () => ({ complete: isKeyValidationComplete(), results: keyValidationResults }),
   getLimiter: () => limiter,
   httpsProxy: HTTPS_PROXY,
   getModelAliases: () => {
     if (!MODEL_ALIASES) return null;
-    return { models: filterResolvableAliases(MODEL_ALIASES.models, cachedModels) };
+    const configuredProviders = getConfiguredModelCacheKeys();
+    return {
+      models: filterResolvableAliases(
+        MODEL_ALIASES.models,
+        filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
+        configuredProviders,
+      ),
+    };
   },
   getModelFallback: () => MODEL_FALLBACK,
   getEffectiveModelFallback: () => getEffectiveModelFallbackForReflect(registeredAdapters),
@@ -134,17 +165,33 @@ const { healthResponse, reflectEndpoints, handleManagementEndpoint } = createMan
 });
 
 function buildModelsJson() {
-  const filteredAliases = MODEL_ALIASES
-    ? { models: filterResolvableAliases(MODEL_ALIASES.models, cachedModels) }
-    : null;
-  return _buildModelsJson(registeredAdapters, cachedModels, filteredAliases);
+  const configuredProviders = getConfiguredModelCacheKeys();
+  const filteredAliases = MODEL_ALIASES ? {
+    models: filterResolvableAliases(
+      MODEL_ALIASES.models,
+      filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
+      configuredProviders,
+    ),
+  } : null;
+  return _buildModelsJson(registeredAdapters, cachedModels, filteredAliases, getRuntimeCatalogSnapshot());
 }
 
 function writeModelsJson(logDir) {
-  const filteredAliases = MODEL_ALIASES
-    ? { models: filterResolvableAliases(MODEL_ALIASES.models, cachedModels) }
-    : null;
-  return _writeModelsJson(registeredAdapters, cachedModels, filteredAliases, logDir);
+  const configuredProviders = getConfiguredModelCacheKeys();
+  const filteredAliases = MODEL_ALIASES ? {
+    models: filterResolvableAliases(
+      MODEL_ALIASES.models,
+      filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
+      configuredProviders,
+    ),
+  } : null;
+  const modelsJson = _buildModelsJson(
+    registeredAdapters,
+    cachedModels,
+    filteredAliases,
+    getRuntimeCatalogSnapshot(),
+  );
+  return _writeModelsJson(registeredAdapters, cachedModels, filteredAliases, logDir, modelsJson);
 }
 
 function createProviderServer(adapter) {
@@ -199,6 +246,7 @@ module.exports = {
   healthResponse,
   buildModelsJson,
   writeModelsJson,
+  getConfiguredModelCacheKeys,
   extractBillingHeaders,
   createProviderServer,
 };

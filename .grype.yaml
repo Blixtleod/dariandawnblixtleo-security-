@@ -1,0 +1,182 @@
+# Grype vulnerability scanner configuration for gh-aw-firewall container images.
+#
+# This file is mounted into the grype container by the supply-chain-scan workflow
+# so that known-accepted / unresolvable findings do not block every PR.
+#
+# Each entry must include a justification comment explaining:
+#   1. Why the finding cannot be fixed in the image layer we control.
+#   2. What the risk acceptance decision is and who should revisit it.
+#
+# Format reference: https://github.com/anchore/grype?tab=readme-ov-file#configuration
+
+ignore:
+  # ── Node.js 22.23.2 Permission Model false positive ───────────────────────────
+  #
+  # CVE-2026-58043 (Node.js Permission Model path matching, HIGH):
+  #   Grype reports this against Node.js 22.23.2 because its advisory record has
+  #   no affected-version bounds. It also reports the finding against the patched
+  #   24.18.1 and 26.5.1 security releases.
+  #
+  #   Node.js 22.23.2 is the official July 29, 2026 security release for the 22.x
+  #   line. The Node.js security announcement lists CVE-2026-58043 among the
+  #   issues fixed by the newly available 22.x, 24.x, and 26.x updates:
+  #   https://nodejs.org/en/blog/vulnerability/july-2026-security-releases
+  #
+  #   Defense in depth: the vulnerable code is only active under Node's
+  #   experimental `--permission` model. AWF does not invoke Node with
+  #   `--permission`, `--allow-fs-read`, or `--allow-fs-write`; filesystem
+  #   isolation is enforced by the container/chroot and bind-mount policy.
+  #
+  #   This exception is scoped to the patched Node.js 22.23.2 binary only. Delete
+  #   it once Grype publishes corrected affected-version metadata.
+  - vulnerability: CVE-2026-58043
+    package:
+      name: node
+      version: "22.23.2"
+      type: binary
+  - vulnerability: CVE-2026-58043
+    package:
+      name: node
+      version: "24.18.1"
+      type: binary
+
+  # ── CPython 3.14.7 corrected affected-version metadata ──────────────────────
+  #
+  # The Python CNA records for these findings mark 3.14.0 through 3.14.6 as
+  # affected and 3.14.7 as fixed. Grype v0.116.0 instead reports 3.14.7 as
+  # vulnerable and lists only 3.15 prereleases as fixes. Keep these exceptions
+  # scoped to the patched 3.14.7 binary and remove them after Grype corrects its
+  # affected-version ranges.
+  - vulnerability: CVE-2026-11940
+    package:
+      name: python
+      version: "3.14.7"
+      type: binary
+  - vulnerability: CVE-2026-15308
+    package:
+      name: python
+      version: "3.14.7"
+      type: binary
+  - vulnerability: CVE-2026-11972
+    package:
+      name: python
+      version: "3.14.7"
+      type: binary
+
+  # ── stdlib@go1.26.3 embedded in Alpine docker-cli ───────────────────────────
+  #
+  # GO-2026-5037 (crypto/x509 VerifyHostname quadratic processing, HIGH):
+  #   A certificate with many DNS SAN entries can make hostname verification
+  #   disproportionately expensive.
+  #
+  #   Risk acceptance — NOT REACHABLE in this image:
+  #     The enclave MCP server invokes /usr/bin/docker only through the local
+  #     Docker Unix socket. It never configures a TCP/TLS Docker endpoint, so the
+  #     affected x509 hostname-verification path cannot execute.
+  #
+  #   No fixed Alpine package is available today: docker-cli 29.5.3-r0 is the
+  #   latest alpine3.24 package and was built with Go 1.26.3. Revisit when Alpine
+  #   publishes a docker-cli build using Go >= 1.26.4.
+  - vulnerability: GO-2026-5037
+    package:
+      name: stdlib
+      version: "go1.26.3"
+      type: go-module
+      location: "/usr/bin/docker"
+
+  # ── stdlib@go1.24.6 embedded in gosu binary ──────────────────────────────────
+  #
+  # GO-2026-4337 (stdlib go1.24.6 -> 1.24.13 / 1.25.7 / 1.26.0-rc.3, CRITICAL):
+  #   During TLS session resumption, changes to ClientCAs or RootCAs between
+  #   the original and resumed handshakes may be ignored, allowing a peer
+  #   whose certificate is no longer trusted to resume the session.
+  #
+  #   Risk acceptance — NOT REACHABLE in gosu:
+  #     gosu is a minimal setuid/exec privilege-drop binary (github.com/tianon/gosu
+  #     v1.19.0). It accepts a user specification and a command, sets up credentials
+  #     via setuid(2)/setgid(2), and calls execve(2). It contains no network code,
+  #     opens no TLS connections, and never calls any crypto/tls function. The
+  #     affected TLS resumption path is entirely unreachable in this binary.
+  #     govulncheck analysis confirms: gosu does not import or exercise any
+  #     crypto/tls code paths (upstream tracking: tianon/gosu#176).
+  #
+  #   No fix is shippable today:
+  #     gosu 1.19.0 is the latest upstream release; no newer official release
+  #     rebuilt with Go >= 1.24.13 exists as of 2026-07-27. Building gosu from
+  #     unreleased source would ship an untagged, unofficial binary (worse
+  #     supply-chain posture than accepting a non-reachable CVE finding).
+  #
+  #   Revisit: once a new official gosu release (> 1.19.0) built with Go >= 1.24.13
+  #   is published, update the GOSU_VERSION pin and per-architecture SHA256
+  #   checksums in containers/agent/Dockerfile and DELETE this entry.
+  #   Tracked in github/gh-aw-firewall#6640.
+  - vulnerability: GO-2026-4337
+    package:
+      name: stdlib
+      version: "go1.24.6"
+      type: go-module
+      location: "/usr/local/bin/gosu"
+
+  # ── brace-expansion bundled inside the vendored npm CLI ──────────────────────
+  #
+  # GHSA-mh99-v99m-4gvg (brace-expansion <=5.0.7 -> 5.0.8, HIGH):
+  #   DoS via unbounded brace expansion length causing an out-of-memory crash.
+  #
+  #   Risk acceptance — BOUNDED DoS in a build-time CLI tool, no other impact:
+  #     This brace-expansion is NOT an application dependency. The agent,
+  #     api-proxy, and cli-proxy images all vendor the npm CLI (pinned
+  #     npm@11.18.0, extracted into /usr/local/lib/node_modules/npm), and npm
+  #     bundles brace-expansion inside its own node_modules. The sidecars build
+  #     with `npm ci --omit=dev`, which prunes their app-level dev copies, so the
+  #     only brace-expansion left in the runtime images is npm's bundled one.
+  #     The worst case is that an `npm` invocation over a hostile brace pattern
+  #     hangs/OOMs that npm process — no privilege escalation, data exfiltration,
+  #     or RCE. npm is a trusted build tool here, not exposed to untrusted input.
+  #
+  #   No fix is shippable today: npm 11.18.0 is the latest npm release and still
+  #   bundles brace-expansion <=5.0.7. brace-expansion 5.0.8 (the patched
+  #   version) exists on the registry but no npm release ships it yet, and
+  #   hand-patching npm's internal bundle would produce a non-official npm.
+  #   Revisit: once an npm release bundling brace-expansion >= 5.0.8 is
+  #   available, bump the npm pin (NPM_TGZ_URL / sha256) in agent/Dockerfile,
+  #   api-proxy/Dockerfile, and cli-proxy/Dockerfile and DELETE this entry.
+  #   Tracked in github/gh-aw-firewall.
+  - vulnerability: GHSA-mh99-v99m-4gvg
+    package:
+      name: brace-expansion
+      type: npm
+
+  # GHSA-rgw5-rvv9-x895 (brace-expansion <5.0.9, HIGH) is a follow-on DoS
+  # affecting the same npm-vendored package and threat surface described above.
+  # AWF does not pass remote input to npm's brace expansion code. npm 12.0.1,
+  # the latest official release as of 2026-08-04, still bundles 5.0.7; retain
+  # this acceptance only until an official npm release bundles >=5.0.9.
+  - vulnerability: GHSA-rgw5-rvv9-x895
+    package:
+      name: brace-expansion
+      type: npm
+
+  # ── ip-address bundled inside the vendored npm CLI ───────────────────────────
+  #
+  # GHSA-mwp4-54f8-5fhr (ip-address <=10.3.0 -> 10.3.1, HIGH):
+  #   IPv4 octets with leading zeroes can be interpreted inconsistently, which
+  #   can bypass an SSRF guard that trusts ip-address classification.
+  #
+  #   Risk acceptance — NOT USED AS A SECURITY BOUNDARY:
+  #     This copy is bundled inside the npm CLI, not an AWF application
+  #     dependency. AWF's proxy, firewall, and network policy do not use it for
+  #     address classification or SSRF decisions. npm is a local CLI in these
+  #     images and its vendored copy is not exposed as a request handler.
+  #
+  #   No official npm release contains the fix yet: npm 12.0.1, the latest
+  #   release as of 2026-08-04, still bundles ip-address 10.2.0. Hand-patching
+  #   npm's internal dependency tree would replace a verified upstream artifact
+  #   with a locally modified distribution.
+  #
+  #   Revisit: once an official npm release bundles ip-address >=10.3.1, update
+  #   the npm tarball pin and SHA256 in all four container Dockerfiles and DELETE
+  #   this entry.
+  - vulnerability: GHSA-mwp4-54f8-5fhr
+    package:
+      name: ip-address
+      type: npm

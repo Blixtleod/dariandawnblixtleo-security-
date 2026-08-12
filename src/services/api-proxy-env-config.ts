@@ -4,6 +4,7 @@ import { WrapperConfig } from '../types';
 import { getConfigEnvValue, getLowerCaseProcessEnvValue, pickEnvVars } from '../env-utils';
 import { OPENAI_ENV, ANTHROPIC_ENV, GEMINI_ENV, COPILOT_ENV, VERTEX_ENV, OIDC_AUTH_ENV_VARS, OIDC_AUTH_ENV_MAPPING } from '../api-proxy-env-constants';
 import { NetworkConfig } from './squid-service';
+import { buildNoProxyEnv } from './no-proxy-utils';
 
 const DEFAULT_API_PROXY_SHUTDOWN_TIMEOUT_MS = 8000;
 
@@ -13,6 +14,8 @@ const DEFAULT_API_PROXY_SHUTDOWN_TIMEOUT_MS = 8000;
  * @internal Exported for testing
  */
 export function buildProviderTargetEnv(config: WrapperConfig): Record<string, string> {
+  const openAiEndpointOverride = resolveOpenAiEndpointOverride(config);
+  const resolvedOpenAiTarget = config.openaiApiTarget ?? openAiEndpointOverride;
   const copilotProviderType = config.copilotProviderType || getConfigEnvValue(config, COPILOT_ENV.PROVIDER_TYPE);
   const copilotProviderBaseUrl = config.copilotProviderBaseUrl || getConfigEnvValue(config, COPILOT_ENV.PROVIDER_BASE_URL);
   const copilotProviderApiKey = config.copilotProviderApiKey;
@@ -21,7 +24,7 @@ export function buildProviderTargetEnv(config: WrapperConfig): Record<string, st
 
   const providers: Array<{ target?: string; basePath?: string; envTarget: string; envBasePath: string; stripTarget?: boolean }> = [
     { target: config.copilotApiTarget, basePath: config.copilotApiBasePath, envTarget: COPILOT_ENV.API_TARGET, envBasePath: COPILOT_ENV.API_BASE_PATH, stripTarget: true },
-    { target: config.openaiApiTarget, basePath: config.openaiApiBasePath, envTarget: OPENAI_ENV.TARGET, envBasePath: OPENAI_ENV.BASE_PATH, stripTarget: true },
+    { target: resolvedOpenAiTarget, basePath: config.openaiApiBasePath, envTarget: OPENAI_ENV.TARGET, envBasePath: OPENAI_ENV.BASE_PATH, stripTarget: true },
     { target: config.anthropicApiTarget, basePath: config.anthropicApiBasePath, envTarget: ANTHROPIC_ENV.TARGET, envBasePath: ANTHROPIC_ENV.BASE_PATH, stripTarget: true },
     { target: config.geminiApiTarget, basePath: config.geminiApiBasePath, envTarget: GEMINI_ENV.TARGET, envBasePath: GEMINI_ENV.BASE_PATH, stripTarget: true },
     { target: config.vertexApiTarget, basePath: config.vertexApiBasePath, envTarget: VERTEX_ENV.TARGET, envBasePath: VERTEX_ENV.BASE_PATH, stripTarget: true },
@@ -69,6 +72,12 @@ function resolveProviderSessionId(config: WrapperConfig): string | undefined {
   return normalizedValue || undefined;
 }
 
+function resolveOpenAiEndpointOverride(config: WrapperConfig): string | undefined {
+  return getConfigEnvValue(config, 'OPENAI_ENDPOINT_OVERRIDE')
+    ?? process.env.OPENAI_ENDPOINT_OVERRIDE?.trim()
+    ?? undefined;
+}
+
 export function resolveApiProxyShutdownTimeoutMs(config: WrapperConfig): number {
   const rawValue = getConfigEnvValue(config, 'AWF_API_PROXY_SHUTDOWN_TIMEOUT_MS')
     ?? process.env.AWF_API_PROXY_SHUTDOWN_TIMEOUT_MS;
@@ -98,6 +107,8 @@ function buildCredentialEnv(config: WrapperConfig): Record<string, string> {
  * platform type, and integration identity.
  */
 function buildProviderRoutingEnv(config: WrapperConfig): Record<string, string> {
+  const openAiEndpointOverride = resolveOpenAiEndpointOverride(config);
+
   return {
     // Configurable API targets (for GHES/GHEC / custom endpoints)
     // Strip any scheme prefix — server.js also normalizes defensively, but
@@ -119,6 +130,7 @@ function buildProviderRoutingEnv(config: WrapperConfig): Record<string, string> 
     ...(getConfigEnvValue(config, 'COPILOT_INTEGRATION_ID')?.trim() && {
       COPILOT_INTEGRATION_ID: getConfigEnvValue(config, 'COPILOT_INTEGRATION_ID')!.trim(),
     }),
+    ...(openAiEndpointOverride && { OPENAI_ENDPOINT_OVERRIDE: openAiEndpointOverride }),
     // Do not forward GITHUB_COPILOT_INTEGRATION_ID — api-proxy defaults to
     // 'agentic-workflows' which is the correct integration ID for AWF.
     // Note: AWF_VERSION is intentionally NOT forwarded here. It is baked into the api-proxy
@@ -141,8 +153,7 @@ function buildProxyRoutingEnv(networkConfig: NetworkConfig): Record<string, stri
     HTTPS_PROXY: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
     https_proxy: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
     // Prevent curl health check from routing localhost through Squid
-    NO_PROXY: 'localhost,127.0.0.1,::1',
-    no_proxy: 'localhost,127.0.0.1,::1',
+    ...buildNoProxyEnv(),
   };
 }
 
@@ -152,6 +163,7 @@ function buildProxyRoutingEnv(networkConfig: NetworkConfig): Record<string, stri
  * api-proxy spans are children of the workflow trace.
  */
 function buildOtelEnv(): Record<string, string> {
+  const workloadIdentityConfigured = Boolean(process.env.GH_AW_OTLP_WORKLOAD_IDENTITY?.trim());
   return {
     // GH_AW_OTLP_ENDPOINTS (JSON array) enables fan-out to multiple collectors.
     // OTEL_EXPORTER_OTLP_ENDPOINT is kept for backward compat (single-endpoint fallback).
@@ -162,7 +174,12 @@ function buildOtelEnv(): Record<string, string> {
       'OTEL_EXPORTER_OTLP_HEADERS',
       'GITHUB_AW_OTEL_TRACE_ID',
       'GITHUB_AW_OTEL_PARENT_SPAN_ID',
+      'GH_AW_OTLP_WORKLOAD_IDENTITY',
     ),
+    ...(workloadIdentityConfigured && pickEnvVars(
+      'ACTIONS_ID_TOKEN_REQUEST_URL',
+      'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
+    )),
     OTEL_SERVICE_NAME: process.env.OTEL_SERVICE_NAME || 'awf-api-proxy',
   };
 }
@@ -188,6 +205,9 @@ function buildRateLimitEnv(config: WrapperConfig): Record<string, string> {
     }),
     ...(config.defaultAiCreditsPricing && {
       AWF_DEFAULT_AI_CREDITS_PRICING: JSON.stringify(config.defaultAiCreditsPricing),
+    }),
+    ...(config.apiProxyProviders && {
+      AWF_API_PROXY_PROVIDERS: JSON.stringify(config.apiProxyProviders),
     }),
     ...(config.effectiveTokenModelMultipliers && {
       AWF_EFFECTIVE_TOKEN_MODEL_MULTIPLIERS: JSON.stringify(config.effectiveTokenModelMultipliers),

@@ -83,6 +83,31 @@ Language SDKs (Go, Node, Java, .NET) are NOT baked into the sysroot image. They 
 - run: echo "RUNNER_TOOL_CACHE=/tmp/gh-aw/tool-cache" >> "$GITHUB_ENV"
 ```
 
+## Writable home under sysroot staging
+
+Sysroot staging drops agent bind mounts whose sources the DinD daemon cannot
+resolve, including AWF's own `${workDir}-chroot-home` volume for `/host$HOME`.
+An explicitly supplied mount is exempt from that filter: if the caller passes
+`--mount <daemon-visible-home>:$HOME:rw` (the gh-aw compiler does this for
+`${RUNNER_TEMP}/gh-aw/home`), the resulting `/host$HOME` mount is kept, because
+the caller vouches for the source being visible to the daemon. The exemption
+matches on both source and target, so AWF's own mounts to the same target stay
+subject to the filter.
+
+A writable `/host$HOME` matters for two reasons:
+
+- the `/dev/null` credential-hiding overlays are mounted under `/host$HOME`, and
+  runc cannot create those mountpoints under a read-only parent;
+- `entrypoint.sh` pre-seeds JVM build tool proxy config (`~/.m2`, `~/.gradle`)
+  under the chroot home.
+
+If no writable `/host$HOME` survives the filter, AWF logs a warning and skips
+the `/host$HOME` credential overlays instead of failing container creation — the
+overlays at the un-prefixed `$HOME` path (on the agent's own rootfs) are still
+applied, but credential files under the chroot home are not masked for that run.
+The entrypoint likewise warns and skips JVM proxy pre-seeding rather than
+aborting.
+
 ## What AWF handles automatically
 
 - Split-filesystem probing for `--docker-host-path-prefix`
@@ -131,7 +156,7 @@ For fine-grained control (or when not using `runner.topology`):
 ## Field behavior
 
 - `chroot.identity.*`: applied inside entrypoint **after** `chroot /host` to override HOME/USER/LOGNAME and identity mapping hints.
-- `chroot.binariesSourcePath`: mounts a runner-side binaries directory over `/usr/local/bin` inside chroot mode so runner-installed CLIs are visible even when `/usr` comes from the DinD daemon filesystem.
+- `chroot.binariesSourcePath`: mounts a runner-side binaries directory at `/host/tmp/awf-runner-bin` (inside chroot: `/tmp/awf-runner-bin`) and prepends it to `PATH`, so runner-installed CLIs are visible even when `/usr` comes from the DinD daemon filesystem.
 - `dind.preStageDirs`: runs a short-lived staging container in DinD mode to create required workdir tree with open permissions.
 - `dind.stageEngineBinary`: copies an engine binary from the runner path into daemon-visible filesystem before compose startup.
 - `dind.stagingImage`: image used for short-lived staging containers.

@@ -54,6 +54,20 @@ The test suite is organized in three tiers:
 | Smoke Tests | 4 | N/A | Per-workflow (scheduled + PR) |
 | Build-Test | 8 | N/A | Per-workflow (PR + dispatch) |
 
+### Unified enclave coverage
+
+Legacy bounded smoke and runtime-matrix assets were removed from the owned workflow surface. Until a unified gh-aw enclave smoke workflow exists, coverage for the enclave MCP server and executor contracts stays local/unit-focused:
+
+- `src/services/enclave-mcp-service.test.ts`
+- `src/services/enclave-agent-service.test.ts`
+- `src/enclave/script-runner-spec.test.ts`
+- `src/enclave/agent-runner-spec.test.ts`
+- `src/enclave/manager.test.ts`
+- `src/enclave/mcp-server.test.ts`
+- `src/enclave/agent-mcp-server.test.ts`
+
+These cover the shared tool contract, gVisor routing assumptions, fail-closed `sbx` behavior, and the mcpg-only topology.
+
 ---
 
 ## What's Covered
@@ -178,3 +192,102 @@ Each document provides per-test-case analysis with plain-language descriptions, 
 - **[Container & Operations Tests](test-analysis/container-ops.md)** — Workdir, volumes, git, env vars, logging, Docker availability
 - **[CI & Smoke Tests](test-analysis/ci-smoke.md)** — All 27 CI/smoke/build-test workflows analyzed
 - **[Test Infrastructure](test-analysis/test-infra.md)** — Runner architecture, batch pattern, cleanup strategy, limitations
+
+## Firecracker preview integration tests
+
+The Firecracker backend has its own separate CI workflow (`test-firecracker.yml`)
+that is distinct from the standard integration test suite above.
+
+**Trigger:** `workflow_dispatch` or pull request open/synchronize/reopen/label.
+Pull requests always run the hosted deterministic artifact build; only label
+`firecracker-kvm` enables the live job. A manual dispatch can set
+`run_live_kvm: false` for an artifact-build-only check. It does **not** run on
+push or schedule.
+
+**Build job** (`ubuntu-24.04`): Builds deterministic guest artifacts — Firecracker
+v1.16.1 binaries, Linux 6.1.141 kernel, BusyBox 1.36.1 rootfs, and AWF guest
+supervisor — from pinned, SHA-256 verified sources. Attests provenance. Uploads
+as a 7-day workflow artifact.
+
+**Live job** (`ubuntu-24.04`): Runs on a GitHub-hosted x64 runner, downloads the
+build artifact, verifies all five SHA-256 digests, and runs the live
+smoke/security suite. The preflight requires usable KVM and fails closed if
+`/dev/kvm` or another required host capability is unavailable.
+
+Live assertions (see `scripts/ci/firecracker-live-smoke.sh`):
+
+| Case | What it proves |
+|------|---------------|
+| `allowed-https` | Allowed domains reach the internet through Squid |
+| `blocked-domain` | Non-allowlisted domains are blocked |
+| `direct-egress` | Bypassing proxy env vars does not enable direct egress |
+| `arbitrary-tcp` | Raw TCP to arbitrary IPs is blocked |
+| `dns-denial` | Direct DNS (8.8.8.8:53) is blocked from the guest |
+| `metadata-denial` | EC2/GCP/Azure instance metadata IP (`169.254.169.254`) is unreachable |
+| `api-proxy-reflect` | API proxy `/reflect` reachable; secret sentinel not present in output |
+| `workspace-copyback` | Guest file writes, permission changes, and symlinks survive copy-back |
+| `exit-code` | Agent exit code propagates faithfully (37 → 37) |
+| `timeout-124` | Timed-out agent exits 124 |
+| `partial-start-cleanup` | Corrupt rootfs causes clean failure; no namespace residue |
+| `cancellation` | `SIGTERM` cleans up network namespace; exits 143 |
+| `keep` | `--keep-containers` preserves jail/namespace/images; all diagnostics ≤1 MiB |
+
+After every case, the suite asserts no `awffc-*` namespaces or Firecracker
+interface residue remain. See [Firecracker integration (preview)](../docs/firecracker-integration.md#part-14--ci-workflow)
+for the full CI workflow specification.
+
+## Cloud Hypervisor preview integration tests
+
+The Cloud Hypervisor backend has its own separate CI workflow
+(`test-cloud-hypervisor.yml`), structurally identical to Firecracker's above
+but scoped to Cloud Hypervisor paths and **GitHub-hosted Ubuntu x86_64
+runners only** (self-hosted runners are explicitly rejected, unlike
+Firecracker's preview).
+
+**Trigger:** `workflow_dispatch`, or pull request open/synchronize/reopen/label
+scoped to `guest/cloud-hypervisor/**`, `src/cloud-hypervisor/**`,
+`src/microvm/**`, and the related scripts/docs/workflow files. Only label
+`cloud-hypervisor-kvm` enables the live job. It does **not** run on push or
+schedule.
+
+**Build job** (`ubuntu-24.04`): Builds deterministic guest artifacts — Cloud
+Hypervisor v53.0 binary, the same pinned Linux 6.1.141 kernel config
+Firecracker uses, BusyBox 1.36.1 rootfs, and the shared AWF guest supervisor —
+from pinned, SHA-256 verified sources. Attests provenance. Uploads as a
+7-day workflow artifact (`cloud-hypervisor-test-x86_64`).
+
+**Live job** (`ubuntu-24.04`): Downloads the build artifact, verifies all four
+SHA-256 digests plus GitHub-hosted-only host eligibility (`GITHUB_ACTIONS`,
+`RUNNER_ENVIRONMENT`, `ImageOS`) and Landlock LSM availability, then runs the
+live smoke/security suite. The preflight requires usable KVM and fails closed
+if `/dev/kvm` or another required host capability is unavailable.
+
+Live assertions (see `scripts/ci/cloud-hypervisor-live-smoke.sh`) reproduce
+Firecracker's full 13-case contract verbatim, plus two Cloud Hypervisor-only
+cases:
+
+| Case | What it proves |
+|------|---------------|
+| `allowed-https` | Allowed domains reach the internet through Squid |
+| `blocked-domain` | Non-allowlisted domains are blocked |
+| `direct-egress` | Bypassing proxy env vars does not enable direct egress |
+| `arbitrary-tcp` | Raw TCP to arbitrary IPs is blocked |
+| `dns-denial` | Direct DNS (8.8.8.8:53) is blocked from the guest |
+| `metadata-denial` | Instance metadata IP (`169.254.169.254`) is unreachable |
+| `api-proxy-reflect` | API proxy `/reflect` reachable; secret sentinel not in output |
+| `workspace-copyback` | Guest file writes, permission changes, and symlinks survive copy-back |
+| `exit-code` | Agent exit code propagates faithfully (37 → 37) |
+| `timeout-124` | Timed-out agent exits 124 |
+| `device-assumptions` **(CH-only)** | `/dev/vda`/`/dev/vdb` and `eth0` guest device assumptions hold |
+| `partial-start-cleanup` | Corrupt rootfs causes clean failure; no residue |
+| `cancellation` | `SIGTERM` cleans up residue within a non-flaky time ceiling; exits 143 |
+| `keep` | `--keep-containers` preserves namespace/run-directory; diagnostics ≤1 MiB |
+| `security-assertions` **(CH-only)** | Live jailer-replacement boundary: non-root uid, `CapEff` limited to `CAP_NET_ADMIN` alone, `no_new_privs`, active seccomp filter, per-run cgroup membership/bounded memory, `landlock_enable` + exactly-minimal disk/net/vsock topology via `vm.info` |
+
+After every case, the suite asserts no `awffc-*` namespaces, `fch*`/`fcn*`/`fct*`
+interfaces (shared naming with Firecracker), `awf-cloud-hypervisor` cgroup
+entries, or `cloud-hypervisor` processes remain. The secret sentinel
+(`awf-cloud-hypervisor-real-secret-do-not-expose`, distinct from
+Firecracker's) is scanned for in the same way. See
+[Cloud Hypervisor integration (preview)](../docs/cloud-hypervisor-foundation.md#part-14--ci-workflow)
+for the full CI workflow specification.

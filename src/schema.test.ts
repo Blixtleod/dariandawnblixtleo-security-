@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import Ajv2020 from 'ajv/dist/2020';
+import Ajv2020 from 'ajv/dist/2020'; // ajv package path, not this project's dist/
 
 const schemaPath = path.join(__dirname, '..', 'docs', 'awf-config.schema.json');
 
@@ -43,6 +43,7 @@ describe('awf-config.schema.json', () => {
         'logging',
         'rateLimiting',
         'platform',
+        'enclaves',
       ])
     );
   });
@@ -153,6 +154,13 @@ describe('awf-config.schema.json', () => {
 
   it('rejects unknown top-level fields', () => {
     expect(validate({ unknown: true })).toBe(false);
+  });
+
+  it.each([
+    `bounded${'Queries'}`,
+    `bounded${'Agents'}`,
+  ])('rejects removed configuration key %s', (removedKey) => {
+    expect(validate({ [removedKey]: { enabled: true } })).toBe(false);
     expect(validate.errors).not.toBeNull();
   });
 

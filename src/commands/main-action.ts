@@ -26,19 +26,16 @@ import { validateOptions } from './validate-options';
 import { probeSplitFilesystem } from '../dind-probe';
 import { assertTopologySupported, connectTopologyContainers } from '../topology';
 import { runDindBootstrap } from '../dind-bootstrap';
-import { runtimeUsesComposeAgent } from '../container-runtime';
-import { createSandbox, execInSandbox, removeSandbox, isSbxAvailable, SBX_DEFAULT_NAME } from '../sbx-manager';
+import { adaptExternalRuntimeBackend } from '../external-runtime-backend';
+import type { ExternalAgentRuntimeBackend } from '../external-runtime-backend';
+import { resolveExternalRuntimeBackend } from '../external-runtime-backend-resolver';
+import { prepareEnclaves, teardownEnclaves } from '../enclave/manager';
+import {
+  assertEnclaveGatewayReady,
+  connectEnclaveGateway,
+  shutdownEnclaveGateway,
+} from '../enclave/gateway';
 import type { WrapperConfig } from '../types';
-import { buildAgentEnvironment } from '../services/agent-service';
-import { buildAgentCredentialEnv } from '../services/api-proxy-credential-env';
-import { DEFAULT_DNS_SERVERS } from '../dns-resolver';
-import { AGENT_IP, CLI_PROXY_IP, DOH_PROXY_IP, SQUID_IP } from '../host-iptables-shared';
-
-/** Report whether a secret is set (and its length) without exposing the value. */
-function redactSecret(value: string | undefined): string {
-  if (!value) return '(unset)';
-  return `(set, len=${value.length})`;
-}
 
 const SENSITIVE_CONFIG_KEYS = new Set([
   'openaiApiKey',
@@ -48,7 +45,11 @@ const SENSITIVE_CONFIG_KEYS = new Set([
   'geminiApiKey',
   'googleApiKey',
   'githubToken',
+  // Secret-derived allowlist entries must not appear in logs or the audit artifact.
+  'sensitiveAllowedDomains',
 ]);
+
+const REFLECT_COMMAND = 'curl --fail --silent --show-error --noproxy "*" http://api-proxy:10000/reflect';
 
 function redactConfigForLogging(config: WrapperConfig): Record<string, unknown> {
   const redactedConfig: Record<string, unknown> = {};
@@ -95,23 +96,61 @@ function buildCleanupFn(
   config: WrapperConfig,
   getContainersStarted: () => boolean,
   getHostIptablesSetup: () => boolean,
+  externalRuntimeBackend?: ExternalAgentRuntimeBackend,
 ) {
   return async (signal?: string) => {
+    let externalRuntimeCleanupError: unknown;
     if (signal) {
       logger.info(`Received ${signal}, cleaning up...`);
     }
 
-    // Clean up sbx sandbox if using microVM runtime
-    if (!runtimeUsesComposeAgent(config.containerRuntime) && !config.keepContainers) {
+    if (externalRuntimeBackend) {
       try {
-        await removeSandbox(SBX_DEFAULT_NAME);
-      } catch {
-        // Sandbox may not exist yet — that's fine
+        if (config.diagnosticLogs) {
+          await externalRuntimeBackend.collectDiagnostics();
+        }
+        if (config.keepContainers && externalRuntimeBackend.preserve) {
+          await externalRuntimeBackend.preserve();
+        } else if (!config.keepContainers) {
+          await externalRuntimeBackend.stop();
+        }
+      } catch (error) {
+        externalRuntimeCleanupError = error;
+        logger.warn(
+          'External runtime cleanup failed; continuing with infrastructure teardown.',
+          error,
+        );
       }
     }
 
-    // Copy iptables audit BEFORE stopping containers (volumes are destroyed by `docker compose down -v`)
+    // Let the enclave server emit final cleanup telemetry before preserving
+    // container artifacts. Stopped containers remain available to docker cp
+    // until the subsequent compose down removes them.
     if (getContainersStarted()) {
+      let enclaveAuditComplete = true;
+      try {
+        await shutdownEnclaveGateway(config);
+      } catch (error) {
+        enclaveAuditComplete = false;
+        logger.warn(
+          'Enclave gateway did not complete graceful shutdown; preserved enclave audit is marked incomplete.',
+          error,
+        );
+      }
+      if (!enclaveAuditComplete && config.enclaves?.enabled) {
+        const targetAuditDir = config.auditDir || path.join(config.workDir, 'audit');
+        try {
+          fs.mkdirSync(targetAuditDir, { recursive: true, mode: 0o755 });
+          const markerPath = path.join(targetAuditDir, 'enclave-audit-incomplete.txt');
+          fs.writeFileSync(
+            markerPath,
+            'Enclave MCP server graceful shutdown was not confirmed; enclave audit artifacts may be incomplete.\n',
+            { mode: 0o644 },
+          );
+        } catch (error) {
+          logger.warn('Failed to write the incomplete enclave audit marker.', error);
+        }
+      }
       preserveIptablesAudit(config.workDir, config.auditDir);
       await stopContainers(config.workDir, config.keepContainers);
     }
@@ -119,6 +158,12 @@ function buildCleanupFn(
     if (getHostIptablesSetup() && !config.keepContainers) {
       await cleanupHostIptables();
     }
+
+    // Remove any probe container still labelled with this run and restore
+    // write permissions on the immutable seeds. Must run before the generic
+    // work-directory cleanup: `rm -rf` cannot unlink entries inside a
+    // directory whose write bit was stripped during staging.
+    await teardownEnclaves(config);
 
     if (!config.keepContainers) {
       await cleanup(
@@ -140,6 +185,7 @@ function buildCleanupFn(
       logger.info(`Squid logs available at: ${config.workDir}/squid-logs/`);
       logger.info(`Host iptables rules preserved (--keep-containers enabled)`);
     }
+    if (externalRuntimeCleanupError) throw externalRuntimeCleanupError;
   };
 }
 
@@ -158,10 +204,16 @@ type OptionSourceResolver = (optionName: string) => string | undefined;
  */
 export function createMainAction(getOptionValueSource: OptionSourceResolver) {
   return async function mainAction(args: string[], options: Record<string, unknown>): Promise<void> {
+  const reflect = options.reflect === true;
+
   // Require -- separator for passing command arguments
-  if (args.length === 0) {
+  if (args.length === 0 && !reflect) {
     console.error('Error: No command specified. Use -- to separate command from options.');
     console.error('Example: awf --allow-domains github.com -- curl https://api.github.com');
+    process.exit(1);
+  }
+  if (reflect && args.length > 0) {
+    console.error('Error: --reflect cannot be used with a command.');
     process.exit(1);
   }
 
@@ -191,13 +243,21 @@ export function createMainAction(getOptionValueSource: OptionSourceResolver) {
   // - We need variables to expand in CONTAINER ($HOME → /root or /home/runner)
   // - The $$$$  escaping pattern requires literal $ preservation
   //
-  const agentCommand = args.length === 1 ? args[0] : joinShellArgs(args);
+  const agentCommand = reflect
+    ? REFLECT_COMMAND
+    : args.length === 1 ? args[0] : joinShellArgs(args);
 
   applyConfigFilePrecedence(options as Record<string, unknown>, getOptionValueSource);
 
   // Validate all options and assemble the config.
   // Calls process.exit(1) on any validation failure.
   const config = validateOptions(options as Record<string, unknown>, agentCommand);
+  if (reflect) {
+    config.additionalEnv = {
+      ...config.additionalEnv,
+      AWF_COMMAND_STDOUT_ONLY: '1',
+    };
+  }
 
   // Apply --docker-host override for AWF's own container operations.
   // This must be called before startContainers/stopContainers/runAgentCommand.
@@ -236,161 +296,69 @@ export function createMainAction(getOptionValueSource: OptionSourceResolver) {
   let exitCode = 0;
   let containersStarted = false;
   let hostIptablesSetup = false;
+  let externalRuntimeBackend: ExternalAgentRuntimeBackend | undefined;
+  try {
+    externalRuntimeBackend = resolveExternalRuntimeBackend(config, startContainers);
+  } catch (error) {
+    logger.error('Fatal error:', error);
+    await buildCleanupFn(
+      config,
+      () => containersStarted,
+      () => hostIptablesSetup,
+    )();
+    console.error('Process exiting with code: 1');
+    process.exit(1);
+    return;
+  }
 
   const performCleanup = buildCleanupFn(
     config,
     () => containersStarted,
     () => hostIptablesSetup,
+    externalRuntimeBackend,
   );
 
   // Register signal handlers for graceful shutdown
   registerSignalHandlers({
     getContainersStarted: () => containersStarted,
     keepContainers: config.keepContainers,
-    fastKillAgentContainer,
+    fastKillAgentContainer: externalRuntimeBackend
+      ? () => externalRuntimeBackend.stop()
+      : fastKillAgentContainer,
     performCleanup,
   });
 
   try {
-    // For sbx (microVM) runtime, wrap startContainers and runAgentCommand
-    // to launch the agent in a sandbox instead of Docker Compose.
-    const useSbx = !runtimeUsesComposeAgent(config.containerRuntime);
-    let sbxName: string | undefined;
-    let sbxEnvironment: Record<string, string> | undefined;
+    if (externalRuntimeBackend) {
+      await externalRuntimeBackend.preflight();
+    }
 
-    const sbxStartContainers = useSbx
-      ? async (workDir: string, allowedDomains: string[], proxyLogsDir?: string, skipPull?: boolean, onNetworkReady?: () => Promise<void>) => {
-          // Start infra-only compose (squid, api-proxy — no agent service)
-          await startContainers(workDir, allowedDomains, proxyLogsDir, skipPull, onNetworkReady);
-
-          // Verify sbx is available
-          if (!await isSbxAvailable()) {
-            throw new Error('Docker sbx CLI not found. Install sbx to use --container-runtime sbx.');
-          }
-
-          // For sbx, the microVM can't reach Docker internal IPs (172.30.0.x).
-          // Published Squid port (3128) is accessible via the sbx gateway IP.
-          // The api-proxy is on the awf-ext bridge network and reachable from
-          // inside the sbx via `host.docker.internal` (resolves to the docker0
-          // bridge IP, typically 172.17.0.1).
-          const SBX_GATEWAY_IP = '172.17.0.0';
-          const SBX_HOST_DOCKER_INTERNAL = 'host.docker.internal';
-
-          sbxEnvironment = buildAgentEnvironment({
-            config,
-            networkConfig: {
-              subnet: '172.30.0.0/24',
-              squidIp: SBX_GATEWAY_IP,
-              agentIp: AGENT_IP,
-              proxyIp: config.enableApiProxy ? SBX_HOST_DOCKER_INTERNAL : undefined,
-              dohProxyIp: config.dnsOverHttps ? DOH_PROXY_IP : undefined,
-              cliProxyIp: config.difcProxyHost ? CLI_PROXY_IP : undefined,
-            },
-            dnsServers: config.dnsServers || DEFAULT_DNS_SERVERS,
-          });
-
-          // Merge credential isolation env vars (COPILOT_API_URL, COPILOT_PROVIDER_BASE_URL, etc.)
-          // In Docker mode these are merged by assembleOptionalServices during compose generation.
-          // For sbx, we call buildAgentCredentialEnv directly with host.docker.internal
-          // as the proxy target (the api-proxy is on the awf-ext bridge network).
-          if (config.enableApiProxy) {
-            const credentialEnv = buildAgentCredentialEnv({
-              config,
-              networkConfig: {
-                subnet: '172.30.0.0/24',
-                squidIp: SBX_GATEWAY_IP,
-                agentIp: AGENT_IP,
-                proxyIp: SBX_HOST_DOCKER_INTERNAL,
-              },
-            });
-            Object.assign(sbxEnvironment, credentialEnv);
-          }
-
-          // Log critical env vars for debugging auth flow (redact secret values)
-          logger.info(`[sbx-env] COPILOT_API_URL=${sbxEnvironment.COPILOT_API_URL || '(unset)'}`);
-          logger.info(`[sbx-env] COPILOT_PROVIDER_BASE_URL=${sbxEnvironment.COPILOT_PROVIDER_BASE_URL || '(unset)'}`);
-          logger.info(`[sbx-env] COPILOT_GITHUB_TOKEN=${redactSecret(sbxEnvironment.COPILOT_GITHUB_TOKEN)}`);
-          logger.info(`[sbx-env] COPILOT_API_KEY=${redactSecret(sbxEnvironment.COPILOT_API_KEY)}`);
-          logger.info(`[sbx-env] HTTPS_PROXY=${sbxEnvironment.HTTPS_PROXY || '(unset)'}`);
-          logger.info(`[sbx-env] COPILOT_PROVIDER_API_KEY=${redactSecret(sbxEnvironment.COPILOT_PROVIDER_API_KEY)}`);
-
-          // Create the sandbox with configured mounts, proxy chaining through Squid
-          const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd();
-          sbxName = await createSandbox({
-            workspaceDir,
-            squidIp: SQUID_IP,
-            extraMounts: config.volumeMounts,
-          });
-
-          // Wait for api-proxy to be healthy before launching agent.
-          // In Docker mode, depends_on: service_healthy gates this; for sbx we poll
-          // via host.docker.internal which resolves to the docker0 bridge from the VM.
-          if (config.enableApiProxy) {
-            logger.info('[sbx] Polling api-proxy health via host.docker.internal...');
-            const healthCmd = [
-              'for i in $(seq 1 30); do',
-              `  if curl -sf --max-time 2 http://${SBX_HOST_DOCKER_INTERNAL}:10000/health >/dev/null 2>&1; then`,
-              '    echo "api-proxy healthy after ${i}s"; exit 0;',
-              '  fi;',
-              '  sleep 1;',
-              'done;',
-              'echo "api-proxy health timeout"; exit 1',
-            ].join(' ');
-
-            const healthResult = await execInSandbox(sbxName, healthCmd, {
-              timeoutMinutes: 1,
-              workDir: config.containerWorkDir,
-              environment: sbxEnvironment,
-            });
-            if (healthResult.exitCode !== 0) {
-              logger.warn('[sbx] api-proxy health check failed — proceeding anyway');
-            }
-          }
-
-          // Verify squid proxy is reachable from sandbox
-          logger.info('[sbx-diag] Verifying squid proxy connectivity...');
-          const diagCmd = [
-            `echo -n "squid ${SBX_GATEWAY_IP}:3128 → "`,
-            `curl -sS --max-time 5 --proxy "http://${SBX_GATEWAY_IP}:3128" -o /dev/null -w "%{http_code}" https://api.github.com/ 2>&1`,
-            'echo ""',
-          ].join(' && ');
-
-          const diagResult = await execInSandbox(sbxName, diagCmd, {
-            timeoutMinutes: 1,
-            workDir: config.containerWorkDir,
-            environment: sbxEnvironment,
-          });
-          logger.info(`[sbx-diag] Connectivity check exited with code ${diagResult.exitCode}`);
+    const externalWorkflowDependencies = externalRuntimeBackend
+      ? adaptExternalRuntimeBackend(externalRuntimeBackend)
+      : undefined;
+    const workflowRunAgentCommand = externalWorkflowDependencies?.runAgentCommand
+      ?? ((workDir: string, allowedDomains: string[], proxyLogsDir?: string, agentTimeoutMinutes?: number) =>
+        runAgentCommand(workDir, allowedDomains, proxyLogsDir, agentTimeoutMinutes, config.containerRuntime));
+    const workflowCollectDiagnosticLogs = externalRuntimeBackend
+      ? async (workDir: string): Promise<void> => {
+         const results = await Promise.allSettled([
+           externalRuntimeBackend.collectDiagnostics(),
+           collectDiagnosticLogs(workDir),
+         ]);
+         const failures = results.filter(
+           (result): result is PromiseRejectedResult => result.status === 'rejected',
+         );
+         if (failures.length > 0) {
+           throw new Error(
+             failures.map((failure) => (
+               failure.reason instanceof Error
+                 ? failure.reason.message
+                 : String(failure.reason)
+             )).join('; '),
+           );
+         }
         }
-      : startContainers;
-
-    const sbxRunAgentCommand = useSbx
-      ? async (_workDir: string, _allowedDomains: string[], _proxyLogsDir?: string, agentTimeoutMinutes?: number) => {
-          if (!sbxName) throw new Error('Sandbox not created');
-          logger.info(`[sbx] Launching agent command in sandbox "${sbxName}" (timeout: ${agentTimeoutMinutes ?? 'none'} min)`);
-          logger.debug(`[sbx] Agent command: ${config.agentCommand.substring(0, 200)}...`);
-          const result = await execInSandbox(sbxName, config.agentCommand, {
-            timeoutMinutes: agentTimeoutMinutes,
-            workDir: config.containerWorkDir,
-            environment: sbxEnvironment,
-            tty: config.tty,
-          });
-          logger.info(`[sbx] Agent command exited with code ${result.exitCode}`);
-
-          // Dump api-proxy logs for debugging connection issues
-          if (config.enableApiProxy && result.exitCode !== 0) {
-            try {
-              const { execSync } = await import('child_process');
-              const proxyLogs = execSync('docker logs --tail 80 awf-api-proxy 2>&1', { encoding: 'utf-8', timeout: 10000 });
-              logger.info(`[sbx-diag] api-proxy logs:\n${proxyLogs}`);
-              const healthStatus = execSync('docker inspect --format={{.State.Health.Status}} awf-api-proxy 2>&1', { encoding: 'utf-8', timeout: 5000 });
-              logger.info(`[sbx-diag] api-proxy health status: ${healthStatus.trim()}`);
-            } catch { /* ignore diagnostic failures */ }
-          }
-
-          return { exitCode: result.exitCode, blockedDomains: [] as string[] };
-        }
-      : runAgentCommand;
+      : collectDiagnosticLogs;
 
     exitCode = await runMainWorkflow(
       config,
@@ -398,11 +366,14 @@ export function createMainAction(getOptionValueSource: OptionSourceResolver) {
         ensureFirewallNetwork,
         setupHostIptables,
         writeConfigs,
-        startContainers: sbxStartContainers,
-        runAgentCommand: sbxRunAgentCommand,
-        collectDiagnosticLogs,
+        startContainers: externalWorkflowDependencies?.startContainers ?? startContainers,
+        runAgentCommand: workflowRunAgentCommand,
+        collectDiagnosticLogs: workflowCollectDiagnosticLogs,
         assertTopologySupported,
         connectTopologyContainers,
+        connectEnclaveGateway,
+        assertEnclaveGatewayReady,
+        prepareEnclaves,
       },
       {
         logger,

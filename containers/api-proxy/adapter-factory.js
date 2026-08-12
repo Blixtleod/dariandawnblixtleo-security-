@@ -29,7 +29,8 @@ const {
  * }|{
  *   kind: 'provider_not_configured',
  *   message: string,
- *   statusCode?: number
+ *   statusCode?: number,
+ *   retryable?: boolean
  * }} spec
  * @returns {import('./providers/index').UnconfiguredResponse}
  */
@@ -37,7 +38,9 @@ function buildUnconfiguredResponse(provider, port, spec) {
   if (spec.kind === 'plain_error') {
     return { statusCode: spec.statusCode, body: { error: spec.message } };
   }
-  const response = makeProviderNotConfiguredResponse(provider, port, spec.message);
+  const response = makeProviderNotConfiguredResponse(provider, port, spec.message, {
+    retryable: spec.retryable === true,
+  });
   if (spec.statusCode !== undefined) {
     response.statusCode = spec.statusCode;
   }
@@ -85,6 +88,7 @@ function createBaseAdapterConfig(env, { keyEnvVar, targetEnvVar, basePathEnvVar,
  * @param {() => boolean} [opts.skipModelsFetch]
  * @param {Record<string,string>|(() => Record<string,string>)} [opts.modelsFetchHeaders]
  * @param {string|null} [opts.modelsCacheKey]
+ * @param {boolean} [opts.credentialConfigured]
  * @param {boolean} [opts.participatesInValidation]
  * @param {boolean} [opts.reflectionConfigured]
  * @param {string|null} [opts.reflectionModelsPath]
@@ -118,7 +122,8 @@ function createAdapterMethods(opts) {
     skipModelsFetch,
     modelsFetchHeaders = validationHeaders,
     modelsCacheKey = provider,
-    participatesInValidation = !!apiKey,
+    credentialConfigured = !!apiKey,
+    participatesInValidation = credentialConfigured,
     reflectionConfigured = !!apiKey,
     reflectionModelsPath = modelsPath,
     reflectionExtra = {},
@@ -132,7 +137,7 @@ function createAdapterMethods(opts) {
   const builtValidationProbe = getValidationProbe || (() => {
     const skip = validationSkip ? validationSkip() : null;
     if (skip) return skip;
-    if (!apiKey) return null;
+    if (!credentialConfigured) return null;
     if (defaultTarget && rawTarget !== defaultTarget) {
       return { skip: true, reason: `Custom target ${rawTarget}; validation skipped` };
     }
@@ -148,7 +153,7 @@ function createAdapterMethods(opts) {
 
   const builtModelsFetchConfig = getModelsFetchConfig || (() => {
     if (skipModelsFetch && skipModelsFetch()) return null;
-    if (!apiKey || !modelsPath || !modelsCacheKey) return null;
+    if (!credentialConfigured || !modelsPath || !modelsCacheKey) return null;
     // Startup model fetch follows provider behavior of honoring explicit basePath
     // prefixes for OpenAI-compatible gateways, while validation probes use the
     // canonical default-target endpoint path.
@@ -212,6 +217,73 @@ function createProviderAuthScaffold(env, deps = {}, { keyEnvVar, targetEnvVar, b
 }
 
 /**
+ * Create an OIDC-aware adapter using the shared auth/header/runtime scaffold.
+ *
+ * @param {object} opts
+ * @param {Record<string, string|undefined>} opts.env
+ * @param {object} [opts.oidcAuthOptions]
+ * @param {(token: string) => Record<string,string>} opts.buildOidcHeaders
+ * @param {() => Record<string,string>} opts.buildStaticHeaders
+ * @param {object|((ctx: object) => object)} opts.createAdapterMethodsOptions
+ * @param {object|((ctx: object) => object)} opts.buildAdapterOptions
+ * @param {(ctx: object) => Record<string,string>} [opts.getAuthHeaders]
+ * @returns {import('./providers/index').ProviderAdapter}
+ */
+function createOidcAwareProviderAdapter({
+  env,
+  oidcAuthOptions = {},
+  buildOidcHeaders,
+  buildStaticHeaders,
+  createAdapterMethodsOptions,
+  buildAdapterOptions,
+  getAuthHeaders,
+}) {
+  const { createProviderOidcHeaderStrategy } = require('./providers/cloud-oidc-init');
+  const oidc = createProviderOidcHeaderStrategy(env, oidcAuthOptions, {
+    buildOidcHeaders,
+    buildStaticHeaders,
+  });
+  const {
+    authProvider,
+    oidcProvider,
+    awsOidcProvider,
+    oidcConfigured,
+    runtimeMethods,
+    validationSkip,
+    skipModelsFetch,
+    resolveHeaders,
+  } = oidc;
+  const context = {
+    authProvider,
+    oidcProvider,
+    awsOidcProvider,
+    oidcConfigured,
+    runtimeMethods,
+    validationSkip,
+    skipModelsFetch,
+    resolveHeaders,
+  };
+  const adapterMethods = createAdapterMethods(typeof createAdapterMethodsOptions === 'function'
+    ? createAdapterMethodsOptions(context)
+    : createAdapterMethodsOptions);
+  const adapterOptions = typeof buildAdapterOptions === 'function'
+    ? buildAdapterOptions({ ...context, adapterMethods })
+    : buildAdapterOptions;
+
+  return buildProviderAdapter({
+    ...adapterOptions,
+    adapterMethods,
+    getAuthHeaders: getAuthHeaders
+      ? (req) => getAuthHeaders({ ...context, req })
+      : (() => resolveHeaders()),
+    extra: {
+      ...runtimeMethods,
+      ...(adapterOptions.extra || {}),
+    },
+  });
+}
+
+/**
  * Assemble a provider adapter object from its constituent parts.
  *
  * Every provider adapter returns the same outer object shape:
@@ -241,7 +313,8 @@ function createProviderAuthScaffold(env, deps = {}, { keyEnvVar, targetEnvVar, b
  * }|{
  *   kind: 'provider_not_configured',
  *   message: string,
- *   statusCode?: number
+ *   statusCode?: number,
+ *   retryable?: boolean
  * }} [opts.missingCredentialResponse] - Declarative default request-time not-configured response
  * @param {(() => ({
  *   kind: 'plain_error',
@@ -250,7 +323,8 @@ function createProviderAuthScaffold(env, deps = {}, { keyEnvVar, targetEnvVar, b
  * }|{
  *   kind: 'provider_not_configured',
  *   message: string,
- *   statusCode?: number
+ *   statusCode?: number,
+ *   retryable?: boolean
  * }|null))} [opts.unconfiguredResponseWhen] - Optional override callback for request-time not-configured response
  * @param {(() => import('./providers/index').UnconfiguredResponse)} [opts.getUnconfiguredHealthResponse] - Optional explicit not-configured /health response (takes precedence over declarative metadata)
  * @param {string}  [opts.healthServiceName]        - Service name for auto-generated /health response (e.g. 'awf-api-proxy-gemini'); requires missingCredentialMessage
@@ -338,6 +412,7 @@ function buildProviderAdapter({
 module.exports = {
   createBaseAdapterConfig,
   createProviderAuthScaffold,
+  createOidcAwareProviderAdapter,
   createAdapterMethods,
   buildProviderAdapter,
 };

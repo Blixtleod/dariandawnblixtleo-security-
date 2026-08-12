@@ -176,16 +176,33 @@ function _resolveAliasPatterns(aliasKey, aliasDefinition, requestedModel, aliase
   log.push(`[model-resolver] alias: "${requestedModel}" → [${patterns.join(', ')}]`);
 
   const candidates = [];
+  // Candidates produced by a nested alias's middle-power fallback are synthesized
+  // guesses, not genuine pattern matches. They are kept separate so they can never
+  // out-rank a sibling pattern that actually matched a model.
+  const synthesizedCandidates = [];
 
   for (const pattern of patterns) {
     const slashIdx = pattern.indexOf('/');
 
     if (slashIdx === -1) {
       // Recursive alias reference (no provider prefix)
-      const sub = resolveModel(pattern, aliases, availableModels, currentProvider, newChain, fallbackConfig, modelPolicyConfig);
+      const sub = resolveModel(
+        pattern,
+        aliases,
+        availableModels,
+        currentProvider,
+        newChain,
+        fallbackConfig,
+        modelPolicyConfig,
+        false
+      );
       if (sub) {
         log.push(...sub.log);
-        candidates.push(sub.resolvedModel);
+        if (sub.fallback && sub.fallback.activated) {
+          synthesizedCandidates.push(sub.resolvedModel);
+        } else {
+          candidates.push(sub.resolvedModel);
+        }
       }
     } else {
       // "provider/modelpattern" ref — only match for the current provider
@@ -203,20 +220,45 @@ function _resolveAliasPatterns(aliasKey, aliasDefinition, requestedModel, aliase
     }
   }
 
+  // Prefer genuine pattern matches. Synthesized fallback picks from nested
+  // aliases are only considered when no sibling pattern matched anything.
+  const effectiveCandidates = candidates.length > 0 ? candidates : synthesizedCandidates;
+  if (candidates.length > 0 && synthesizedCandidates.length > 0) {
+    log.push(
+      `[model-resolver] ignoring ${synthesizedCandidates.length} synthesized fallback candidate(s) ` +
+      `in favour of ${candidates.length} genuine match(es)`
+    );
+  }
+
   // Apply model policy filter: remove candidates that are not permitted.
   const filteredCandidates = modelPolicyConfig
-    ? candidates.filter(c => _isModelPermittedByPolicy(c, modelPolicyConfig))
-    : candidates;
+    ? effectiveCandidates.filter(c => _isModelPermittedByPolicy(c, modelPolicyConfig))
+    : effectiveCandidates;
 
-  if (filteredCandidates.length < candidates.length) {
-    const blocked = candidates.filter(c => !filteredCandidates.includes(c));
+  if (filteredCandidates.length < effectiveCandidates.length) {
+    const blocked = effectiveCandidates.filter(c => !filteredCandidates.includes(c));
     log.push(`[model-resolver] model policy filtered out ${blocked.length} candidate(s): ${blocked.slice(0, 5).join(', ')}${blocked.length > 5 ? ', …' : ''}`);
   }
 
   if (filteredCandidates.length === 0) {
     log.push(`[model-resolver] no candidates found for "${aliasKey}" on provider "${currentProvider}"`);
     const hasProviderPattern = patterns.some((pattern) => pattern.includes('/'));
-    if (aliasDefinition.fallback && hasProviderPattern && !modelPolicyConfig) {
+    // Only fall back when this alias actually names the current provider. An alias
+    // whose patterns target *other* providers (e.g. "haiku" → copilot/*, anthropic/*
+    // evaluated on an openai proxy) has a legitimately empty candidate set.
+    //
+    // This is enforced only for *nested* alias references, where sibling patterns in
+    // the parent fan-out can still supply a genuine match. A top-level request keeps
+    // the existing graceful-degradation behaviour of substituting something rather
+    // than failing outright.
+    const isNestedReference = newChain.length > 1;
+    const targetsCurrentProvider = patterns.some((pattern) => {
+      const slashIdx = pattern.indexOf('/');
+      return slashIdx !== -1 &&
+        pattern.slice(0, slashIdx).toLowerCase() === currentProvider.toLowerCase();
+    });
+    const fallbackAllowed = !isNestedReference || targetsCurrentProvider;
+    if (aliasDefinition.fallback && fallbackAllowed && hasProviderPattern && !modelPolicyConfig) {
       return tryMiddlePowerFallback(
         requestedModel, availableModels, currentProvider,
         'no_alias_match_and_not_in_available_models', fallbackConfig, log
@@ -230,6 +272,7 @@ function _resolveAliasPatterns(aliasKey, aliasDefinition, requestedModel, aliase
   unique.sort(compareByVersion);
 
   const resolved = unique[0];
+  const resolvedViaSynthesis = candidates.length === 0 && synthesizedCandidates.length > 0;
   log.push(
     `[model-resolver] resolved: "${requestedModel}" → "${resolved}"` +
     (unique.length > 1
@@ -242,7 +285,13 @@ function _resolveAliasPatterns(aliasKey, aliasDefinition, requestedModel, aliase
     candidates: unique,
     log,
     fallback: fallbackConfig.enabled
-      ? { activated: false, selection_method: 'middle_power_median', reason: 'normal_resolution_succeeded' }
+      ? {
+        activated: resolvedViaSynthesis,
+        selection_method: 'middle_power_median',
+        reason: resolvedViaSynthesis
+          ? 'no_alias_match_and_not_in_available_models'
+          : 'normal_resolution_succeeded',
+      }
       : undefined,
   };
 }
@@ -252,9 +301,10 @@ function _resolveAliasPatterns(aliasKey, aliasDefinition, requestedModel, aliase
  *
  * Resolution algorithm:
  * 1. Loop detection — bail out if key already visited.
- * 2. Alias lookup (case-insensitive); family alias fallback for gpt-5.<minor>.
- * 3. No alias found → _resolveDirectMatch (direct, family-version, or middle-power).
- * 4. Alias found → _resolveAliasPatterns (pattern expansion + best-candidate selection).
+ * 2. Direct match — preserve an explicitly available provider model.
+ * 3. Alias lookup (case-insensitive); family alias fallback for gpt-5.<minor>.
+ * 4. No alias found → _resolveDirectMatch (family-version or middle-power fallback).
+ * 5. Alias found → _resolveAliasPatterns (pattern expansion + best-candidate selection).
  *
  * @param {string} requestedModel - Model name from the request body (or "" for default)
  * @param {Record<string, string[]|{patterns: string[], fallback?: boolean}>} aliases - Alias map from parseModelAliases()
@@ -263,12 +313,34 @@ function _resolveAliasPatterns(aliasKey, aliasDefinition, requestedModel, aliase
  * @param {string[]} [chain=[]] - Accumulates visited alias names for loop detection
  * @param {{ enabled?: boolean, strategy?: string }} [modelFallbackConfig]
  * @param {{ allowedModels?: string[]|null, disallowedModels?: string[]|null }|null} [modelPolicyConfig]
+ * @param {boolean} [preferDirectRequest=true] - Prefer an exact provider model over a same-named alias for top-level requests
  * @returns {{ resolvedModel: string, candidates: string[], log: string[], fallback?: object } | null}
  */
-function resolveModel(requestedModel, aliases, availableModels, currentProvider, chain = [], modelFallbackConfig = DEFAULT_MODEL_FALLBACK, modelPolicyConfig = null) {
+function resolveModel(
+  requestedModel,
+  aliases,
+  availableModels,
+  currentProvider,
+  chain = [],
+  modelFallbackConfig = DEFAULT_MODEL_FALLBACK,
+  modelPolicyConfig = null,
+  preferDirectRequest = true
+) {
   const log = [];
   const key = requestedModel.toLowerCase();
   const fallbackConfig = normalizeFallbackConfig(modelFallbackConfig);
+
+  if (currentProvider === 'copilot' && key === 'auto') {
+    log.push('[model-resolver] special pass-through: "auto"');
+    return {
+      resolvedModel: requestedModel,
+      candidates: [requestedModel],
+      log,
+      fallback: fallbackConfig.enabled
+        ? { activated: false, selection_method: 'middle_power_median', reason: 'direct_match' }
+        : undefined,
+    };
+  }
 
   // Loop detection
   if (chain.includes(key)) {
@@ -277,32 +349,33 @@ function resolveModel(requestedModel, aliases, availableModels, currentProvider,
   }
   const newChain = [...chain, key];
 
-  // Find alias entry (case-insensitive)
-  let aliasEntry = Object.entries(aliases).find(([k]) => k.toLowerCase() === key);
-
-  if (!aliasEntry) {
-    // Prefer exact provider-advertised model names over family-alias fallback.
-    // This avoids silently rewriting a concrete user request (e.g. gpt-5.6-sol)
-    // to another family member when that exact model is already available.
+  // An explicit model available from this provider is authoritative over any
+  // matching alias. This prevents an alias with the same name from silently
+  // steering a request away from the configured provider.
+  if (preferDirectRequest) {
     const providerModels = (availableModels[currentProvider] || []);
     const direct = providerModels.find(m => m.toLowerCase() === key);
     if (direct) {
       if (!_isModelPermittedByPolicy(direct, modelPolicyConfig)) {
-        // Model is advertised but blocked by policy — treat as terminal to prevent
-        // a denied model from being silently rewritten to a permitted family member.
         log.push(`[model-resolver] model policy blocked direct match: "${direct}"`);
         return null;
       }
       log.push(`[model-resolver] direct match: "${requestedModel}" → "${direct}"`);
       return {
         resolvedModel: direct,
+        candidates: [direct],
         log,
         fallback: fallbackConfig.enabled
           ? { activated: false, selection_method: 'middle_power_median', reason: 'direct_match' }
           : undefined,
       };
     }
+  }
 
+  // Find alias entry (case-insensitive)
+  let aliasEntry = Object.entries(aliases).find(([k]) => k.toLowerCase() === key);
+
+  if (!aliasEntry) {
     // Family fallback: treat gpt-5.<minor> as gpt-5 when only the family alias
     // exists. This keeps versioned IDs like gpt-5.4 compatible with configs that
     // define "gpt-5" alias patterns.
@@ -329,7 +402,8 @@ function resolveModel(requestedModel, aliases, availableModels, currentProvider,
  * available model for at least one provider that has model data.
  *
  * An alias is kept when:
- *   - No provider has model data yet (unknown state — keep all aliases).
+ *   - No provider has model data yet and its patterns can target a configured
+ *     provider (or configured providers are unknown).
  *   - The alias resolves to a concrete model for at least one provider with data.
  *
  * Middle-power fallback is intentionally disabled during filtering so that only
@@ -338,29 +412,51 @@ function resolveModel(requestedModel, aliases, availableModels, currentProvider,
  *
  * @param {Record<string, string[]|{patterns: string[], fallback?: boolean}>} aliases
  * @param {Record<string, string[]|null>} availableModels - Cached models per provider (null = not yet fetched)
+ * @param {Set<string>|string[]|null|undefined} [configuredProviders] - Provider cache keys that are configured
  * @returns {Record<string, string[]|{patterns: string[], fallback?: boolean}>}
  */
-function filterResolvableAliases(aliases, availableModels) {
+function filterResolvableAliases(aliases, availableModels, configuredProviders) {
   if (!aliases || typeof aliases !== 'object') return aliases;
+  const configured = configuredProviders === null || configuredProviders === undefined
+    ? null
+    : (configuredProviders instanceof Set
+      ? configuredProviders
+      : new Set(Array.isArray(configuredProviders) ? configuredProviders : []));
 
   // Providers with a non-empty model list (data is available)
   const providersWithData = Object.entries(availableModels)
     .filter(([, models]) => Array.isArray(models) && models.length > 0)
     .map(([provider]) => provider);
 
-  // No model data yet — cannot make decisions, keep all aliases
-  if (providersWithData.length === 0) return aliases;
+  if (providersWithData.length === 0) {
+    if (configured === null) return aliases;
+    const result = {};
+    for (const aliasKey of Object.keys(aliases)) {
+      if (_aliasCanTargetConfiguredProvider(aliasKey, aliases, configured)) {
+        result[aliasKey] = aliases[aliasKey];
+      }
+    }
+    return result;
+  }
 
   const noFallback = { enabled: false };
   const result = {};
+  const configuredProvidersWithoutData = configured === null
+    ? new Set()
+    : new Set([...configured].filter(provider => !Array.isArray(availableModels[provider])));
 
   for (const aliasKey of Object.keys(aliases)) {
-    const canResolve = providersWithData.some(provider => {
-      const resolution = resolveModel(aliasKey, aliases, availableModels, provider, [], noFallback);
+    const canResolveWithKnownModels = providersWithData.some(provider => {
+      const resolution = resolveModel(aliasKey, aliases, availableModels, provider, [], noFallback, null, false);
       return resolution !== null;
     });
+    const mayResolveWhenPendingCatalogLoads = _aliasCanTargetConfiguredProvider(
+      aliasKey,
+      aliases,
+      configuredProvidersWithoutData,
+    );
 
-    if (canResolve) {
+    if (canResolveWithKnownModels || mayResolveWhenPendingCatalogLoads) {
       result[aliasKey] = aliases[aliasKey];
     }
   }
@@ -368,8 +464,73 @@ function filterResolvableAliases(aliases, availableModels) {
   return result;
 }
 
+/**
+ * Conservatively determine whether an alias can target any configured provider
+ * before provider model catalogues are available.
+ *
+ * @param {string} aliasKey
+ * @param {Record<string, string[]|{patterns: string[], fallback?: boolean}>} aliases
+ * @param {Set<string>} configuredProviders
+ * @param {Set<string>} [chain]
+ * @returns {boolean}
+ */
+function _aliasCanTargetConfiguredProvider(aliasKey, aliases, configuredProviders, chain = new Set()) {
+  const normalizedKey = aliasKey.toLowerCase();
+  if (chain.has(normalizedKey)) return false;
+
+  const aliasEntry = Object.entries(aliases).find(([key]) => key.toLowerCase() === normalizedKey);
+  if (!aliasEntry) return configuredProviders.size > 0;
+
+  const nextChain = new Set(chain);
+  nextChain.add(normalizedKey);
+  const { patterns } = resolveAliasDefinition(aliasEntry[1]);
+  return patterns.some((pattern) => {
+    const slashIdx = pattern.indexOf('/');
+    if (slashIdx !== -1) {
+      return configuredProviders.has(pattern.slice(0, slashIdx).toLowerCase());
+    }
+    return _aliasCanTargetConfiguredProvider(pattern, aliases, configuredProviders, nextChain);
+  });
+}
+
+/**
+ * Restrict a provider→models map to the providers that are actually configured
+ * for this run.
+ *
+ * Alias resolution treats any provider with a populated model list as a valid
+ * steering target. When a provider slot has no credentials (the proxy reports
+ * `configured: false` for it and answers every request with
+ * `provider_not_configured`), steering a request there guarantees a 100% failure
+ * rate. Blanking those providers' model lists before resolution makes them
+ * invisible to the alias table, so candidates are only ever drawn from provider
+ * slots that can actually serve a request.
+ *
+ * When `configuredProviders` is null/undefined, the map is returned unchanged
+ * because configuration is unknown. An empty set is a known state and blanks
+ * every provider.
+ *
+ * @param {Record<string, string[]|null>} availableModels
+ * @param {Set<string>|string[]|null|undefined} configuredProviders - Provider cache keys that are configured
+ * @returns {Record<string, string[]|null>}
+ */
+function filterAvailableModelsToConfiguredProviders(availableModels, configuredProviders) {
+  if (!availableModels || typeof availableModels !== 'object') return availableModels;
+  if (configuredProviders === null || configuredProviders === undefined) return availableModels;
+
+  const configured = configuredProviders instanceof Set
+    ? configuredProviders
+    : new Set(Array.isArray(configuredProviders) ? configuredProviders : []);
+
+  const result = {};
+  for (const [provider, models] of Object.entries(availableModels)) {
+    result[provider] = configured.has(provider) ? models : null;
+  }
+  return result;
+}
+
 module.exports = {
   parseModelAliases,
+  filterAvailableModelsToConfiguredProviders,
   globMatch,
   extractVersionNumbers,
   compareByVersion,

@@ -285,6 +285,23 @@ describe('generateDockerCompose', () => {
         expect(squidNetworks['awf-ext']).toBeDefined();
       });
 
+      it('keeps cli-proxy on awf-net only when it targets an attached DIFC proxy', () => {
+        const config = {
+          ...mockConfig,
+          networkIsolation: true,
+          difcProxyHost: 'awmg-cli-proxy:18443',
+        };
+        const networkWithCliProxy = {
+          ...mockNetworkConfig,
+          cliProxyIp: '172.30.0.50',
+        };
+        const result = generateDockerCompose(config, networkWithCliProxy);
+
+        const cliProxyNetworks = result.services['cli-proxy'].networks as { [key: string]: { ipv4_address?: string } };
+        expect(cliProxyNetworks['awf-net'].ipv4_address).toBe('172.30.0.50');
+        expect(cliProxyNetworks['awf-ext']).toBeUndefined();
+      });
+
       it('should keep the agent on awf-net only (no external network)', () => {
         const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
 
@@ -311,6 +328,18 @@ describe('generateDockerCompose', () => {
         expect(result.services.agent.dns).toEqual(['127.0.0.11']);
       });
 
+      it('keeps host gateway off the agent proxy bypass list in topology mode', () => {
+        const result = generateDockerCompose(
+          { ...mockConfig, networkIsolation: true, enableHostAccess: true },
+          mockNetworkConfig,
+        );
+
+        const noProxy = String(result.services.agent.environment?.NO_PROXY ?? '').split(',');
+        expect(noProxy).not.toContain('host.docker.internal');
+        expect(noProxy).not.toContain('172.30.0.1');
+        expect(result.services.agent.extra_hosts?.['host.docker.internal']).toBeUndefined();
+      });
+
       it('should still build the iptables-init service in default (iptables) mode', () => {
         const result = generateDockerCompose(mockConfig, mockNetworkConfig);
 
@@ -318,6 +347,45 @@ describe('generateDockerCompose', () => {
         expect(result.networks['awf-net'].external).toBe(true);
         expect(result.networks['awf-ext']).toBeUndefined();
         expect(result.services.agent.environment?.AWF_NETWORK_ISOLATION).toBeUndefined();
+      });
+    });
+
+    describe('gVisor runtime (non-iptables compose agent)', () => {
+      it('omits iptables-init but keeps the compose agent when networkIsolation is false', () => {
+        const config = {
+          ...mockConfig,
+          containerRuntime: 'gvisor',
+          networkIsolation: false,
+        };
+        const result = generateDockerCompose(config, mockNetworkConfig);
+
+        expect(result.services.agent).toBeDefined();
+        expect(result.services['iptables-init']).toBeUndefined();
+      });
+
+      it('sets AWF_SKIP_IPTABLES_INIT (not AWF_NETWORK_ISOLATION) in the agent environment', () => {
+        const config = {
+          ...mockConfig,
+          containerRuntime: 'gvisor',
+          networkIsolation: false,
+        };
+        const result = generateDockerCompose(config, mockNetworkConfig);
+
+        expect(result.services.agent.environment?.AWF_SKIP_IPTABLES_INIT).toBe('1');
+        expect(result.services.agent.environment?.AWF_NETWORK_ISOLATION).toBeUndefined();
+      });
+
+      it('treats the raw runsc runtime name the same as gvisor', () => {
+        const config = {
+          ...mockConfig,
+          containerRuntime: 'runsc',
+          networkIsolation: false,
+        };
+        const result = generateDockerCompose(config, mockNetworkConfig);
+
+        expect(result.services.agent).toBeDefined();
+        expect(result.services['iptables-init']).toBeUndefined();
+        expect(result.services.agent.environment?.AWF_SKIP_IPTABLES_INIT).toBe('1');
       });
     });
 
@@ -542,7 +610,7 @@ describe('generateDockerCompose', () => {
 
         generateDockerCompose(config, mockNetworkConfig);
 
-        expect(warnSpy).not.toHaveBeenCalled();
+        expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('under /opt'));
         warnSpy.mockRestore();
       });
 
@@ -582,7 +650,9 @@ describe('generateDockerCompose', () => {
         expect(homeTargets).toContain(`/host${workspaceDir}`);
         expect(homeTargets.some(target => target.startsWith(`/host${effectiveHomeForFilter}/.`))).toBe(false);
 
-        // Home root mounts (including trailing slash source) should be dropped.
+        // An explicitly supplied home-root mount (including trailing slash source)
+        // survives the filter: the caller vouches for its daemon visibility, and a
+        // writable /host$HOME is required by the credential overlays and entrypoint.
         const effectiveHome = getRealUserHome();
         const configWithHomeRootMount = {
           ...config,
@@ -593,7 +663,28 @@ describe('generateDockerCompose', () => {
           const target = v.split(':')[1];
           return target === `/host${effectiveHome}` || target === `/host${effectiveHome}/`;
         });
-        expect(homeRootMounts).toHaveLength(0);
+        expect(homeRootMounts).toEqual([`${effectiveHome}/:/host${effectiveHome}:rw`]);
+
+        // The chroot-home volume sourced from workDir is still dropped.
+        expect(
+          (resultWithHomeRootMount.services.agent.volumes as string[]).some(v =>
+            v.startsWith('/tmp/awf-12345-chroot-home'),
+          ),
+        ).toBe(false);
+
+        // Credential overlays under /host$HOME are kept when a writable home survives.
+        expect(
+          (resultWithHomeRootMount.services.agent.volumes as string[]).some(
+            v => v.startsWith('/dev/null:') && v.split(':')[1].startsWith(`/host${effectiveHome}/`),
+          ),
+        ).toBe(true);
+
+        // Without such a mount, those overlays are skipped (no writable parent exists).
+        expect(
+          volumes.some(
+            v => v.startsWith('/dev/null:') && v.split(':')[1].startsWith(`/host${effectiveHome}/`),
+          ),
+        ).toBe(false);
 
         // Should still have /tmp:/tmp, /sys, /dev, sysroot volume
         expect(volumes).toContain('/tmp:/tmp:rw');

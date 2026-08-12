@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../../logger';
 import { WrapperConfig } from '../../types';
+import { applyHostPathPrefixToVolumes } from '../host-path-prefix';
 import {
   extractCommandBinaryName,
   shouldUseDockerHostStaging,
@@ -88,24 +89,49 @@ function isExecutableFile(candidate: string): boolean {
   }
 }
 
-export function buildCustomVolumeMounts(volumeMounts?: string[]): string[] {
+export function buildCustomVolumeMounts(
+  volumeMounts?: string[],
+  dockerHostPathPrefix?: string,
+  options: { quiet?: boolean } = {},
+): string[] {
   if (!volumeMounts || volumeMounts.length === 0) {
     return [];
   }
 
-  logger.debug(`Adding ${volumeMounts.length} custom volume mount(s)`);
+  // `quiet` is used by callers that only re-derive the transformed specs for
+  // comparison (e.g. the sysroot volume filter) and must not log them twice.
+  const debug = (message: string) => {
+    if (!options.quiet) logger.debug(message);
+  };
 
-  return volumeMounts.map(mount => {
+  debug(`Adding ${volumeMounts.length} custom volume mount(s)`);
+
+  // Custom mount sources always use the runner's filesystem view. Translate
+  // them even when a source already starts with the daemon-side prefix; this
+  // is required when both are /tmp/gh-aw in ARC/DinD safeoutputs workflows.
+  const translatedMounts = applyHostPathPrefixToVolumes(
+    volumeMounts,
+    dockerHostPathPrefix,
+    { translateAlreadyPrefixedPaths: true },
+  );
+
+  return translatedMounts.map((mount, index) => {
     const parts = mount.split(':');
     if (parts.length >= 2) {
       const hostPath = parts[0];
       const containerPath = parts[1];
       const mode = parts[2] || '';
-      const chrootContainerPath = `/host${containerPath}`;
+      // Targets that already carry the chroot prefix (some callers emit both an
+      // un-prefixed and a `/host`-prefixed mount) must not be prefixed again,
+      // otherwise they land at `/host/host/…` and mount nothing meaningful.
+      const chrootContainerPath =
+        containerPath === '/host' || containerPath.startsWith('/host/')
+          ? containerPath
+          : `/host${containerPath}`;
       const transformedMount = mode
         ? `${hostPath}:${chrootContainerPath}:${mode}`
         : `${hostPath}:${chrootContainerPath}`;
-      logger.debug(`Adding custom volume mount: ${mount} -> ${transformedMount} (chroot-adjusted)`);
+      debug(`Adding custom volume mount: ${volumeMounts[index]} -> ${transformedMount} (chroot-adjusted)`);
       return transformedMount;
     }
 

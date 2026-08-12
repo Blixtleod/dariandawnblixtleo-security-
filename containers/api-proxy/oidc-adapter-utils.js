@@ -49,16 +49,25 @@ function validateAuthHeaderEnv(envVarName, rawValue, defaultHeader) {
  * @returns {{
  *   isEnabled: () => boolean,
  *   getOidcProvider: () => unknown,
- *   getAwsOidcProvider: () => unknown
+ *   getAwsOidcProvider: () => unknown,
+ *   getRequestSigner: () => (((request: object) => Record<string,string>)|null)
  * }}
  */
 function createOidcRuntimeAdapterMethods({ staticAuthToken, oidcProvider, awsOidcProvider }) {
   return {
     isEnabled() {
-      return !!staticAuthToken || !!oidcProvider?.isReady() || !!awsOidcProvider?.isReady();
+      if (oidcProvider || awsOidcProvider) {
+        return !!oidcProvider?.isReady() || !!awsOidcProvider?.isReady();
+      }
+      return !!staticAuthToken;
     },
     getOidcProvider() { return oidcProvider; },
     getAwsOidcProvider() { return awsOidcProvider; },
+    getRequestSigner() {
+      return awsOidcProvider
+        ? request => awsOidcProvider.signRequest(request)
+        : null;
+    },
   };
 }
 

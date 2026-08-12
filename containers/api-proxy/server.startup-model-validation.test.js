@@ -67,6 +67,16 @@ describe('validateRequestedModel', () => {
     }));
   });
 
+  it('treats the Copilot auto model as available without requiring it in provider model lists', () => {
+    process.env.AWF_REQUESTED_MODEL = 'auto';
+    cachedModels.copilot = ['gpt-4o', 'gpt-4o-mini'];
+    validateRequestedModel();
+    expect(logRequest).toHaveBeenCalledWith('info', 'model_validation', expect.objectContaining({
+      requested_model: 'auto',
+      resolved_via: 'direct',
+    }));
+  });
+
   it('searches across multiple providers', () => {
     process.env.AWF_REQUESTED_MODEL = 'claude-sonnet-4-5';
     cachedModels.copilot = ['gpt-4o'];
@@ -117,6 +127,35 @@ describe('validateRequestedModel', () => {
       expect(isolatedLog).toHaveBeenCalledWith('info', 'model_validation', expect.objectContaining({
         requested_model: 'sonnet',
         resolved_via: 'alias',
+      }));
+    } finally {
+      if (prevAliases === undefined) delete process.env.AWF_MODEL_ALIASES;
+      else process.env.AWF_MODEL_ALIASES = prevAliases;
+    }
+  });
+
+  it('logs an explicit provider model as direct when it shares an alias name', () => {
+    const prevAliases = process.env.AWF_MODEL_ALIASES;
+    process.env.AWF_MODEL_ALIASES = JSON.stringify({
+      models: { 'claude-sonnet-5': ['copilot/claude-sonnet-6*'] },
+    });
+
+    let isolatedServer;
+    jest.isolateModules(() => {
+      jest.mock('./logging', () => ({ logRequest: jest.fn() }));
+      isolatedServer = require('./server');
+    });
+
+    const { logRequest: isolatedLog } = require('./logging');
+
+    try {
+      isolatedServer.resetModelCacheState();
+      isolatedServer.cachedModels.anthropic = ['claude-sonnet-5'];
+      process.env.AWF_REQUESTED_MODEL = 'claude-sonnet-5';
+      isolatedServer.validateRequestedModel();
+      expect(isolatedLog).toHaveBeenCalledWith('info', 'model_validation', expect.objectContaining({
+        requested_model: 'claude-sonnet-5',
+        resolved_via: 'direct',
       }));
     } finally {
       if (prevAliases === undefined) delete process.env.AWF_MODEL_ALIASES;

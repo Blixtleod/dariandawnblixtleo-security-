@@ -10,6 +10,89 @@ permissions:
   contents: read
 
 jobs:
+  enclave-script-coverage:
+    name: Enclave script gVisor coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gVisor
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}"
+          wget -q "${URL}/runsc" "${URL}/containerd-shim-runsc-v1"
+          chmod +x runsc containerd-shim-runsc-v1
+          sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
+          sudo mkdir -p /etc/docker
+          cat <<'EOF' | sudo tee /etc/docker/daemon.json
+          {"runtimes":{"runsc":{"path":"/usr/local/bin/runsc"}}}
+          EOF
+          sudo systemctl restart docker
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Exercise current enclave gVisor unit coverage
+        run: |
+          npm ci
+          npm run build
+          npm test -- --runInBand \
+            src/services/enclave-mcp-service.test.ts \
+            src/services/enclave-agent-service.test.ts \
+            src/enclave/script-runner-spec.test.ts \
+            src/enclave/agent-runner-spec.test.ts
+      - name: Smoke-test no-network script executor under Docker and gVisor
+        run: |
+          set -euo pipefail
+          image=awf-enclave-script-smoke
+          docker build --target enclave-script \
+            -f containers/enclave/Dockerfile \
+            -t "$image" containers
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          mkdir -p "$root/seed"
+          printf 'private fixture\n' > "$root/seed/value.txt"
+          printf '' > "$root/out"
+          cat > "$root/script.py" <<'PY'
+          import pathlib
+          import socket
+
+          assert pathlib.Path("/query/repo/value.txt").read_text() == "private fixture\n"
+          try:
+              socket.create_connection(("1.1.1.1", 80), timeout=1)
+          except OSError:
+              pass
+          else:
+              raise SystemExit("network unexpectedly available")
+          pathlib.Path("/query/out").write_text("true")
+          PY
+          sudo chown 65534:65534 "$root/out"
+          for runtime in runc runsc; do
+            printf '' | sudo tee "$root/out" >/dev/null
+            sudo chown 65534:65534 "$root/out"
+            docker run --rm \
+              --runtime "$runtime" \
+              --network none \
+              --read-only \
+              --user 65534:65534 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --security-opt "seccomp=$(pwd)/containers/enclave/seccomp.json" \
+              --entrypoint /usr/local/bin/run-enclave-script \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+              --tmpfs /query:rw,nosuid,nodev,size=16m,uid=65534,gid=65534,mode=0700 \
+              -v "$root/seed:/awf/seed:ro" \
+              -v "$root/script.py:/awf/query-script.py:ro" \
+              -v "$root/out:/awf/out:rw" \
+              "$image"
+            test "$(cat "$root/out")" = true
+          done
+
   install-gvisor:
     name: Install gVisor
     runs-on: ubuntu-latest

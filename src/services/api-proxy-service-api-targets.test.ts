@@ -37,6 +37,20 @@ describe('API proxy sidecar: API targets and auth forwarding', () => {
         expect(env.OPENAI_API_TARGET).toBeUndefined();
       });
 
+      it('should pass OPENAI_ENDPOINT_OVERRIDE to api-proxy when provided via additionalEnv', () => {
+        const configWithProxy = {
+          ...mockConfig,
+          enableApiProxy: true,
+          openaiApiKey: 'sk-test-key',
+          additionalEnv: { OPENAI_ENDPOINT_OVERRIDE: 'https://secret-router.internal/path' },
+        };
+        const result = generateDockerCompose(configWithProxy, mockNetworkConfigWithProxy);
+        const proxy = result.services['api-proxy'];
+        const env = proxy.environment as Record<string, string>;
+        expect(env.OPENAI_ENDPOINT_OVERRIDE).toBe('https://secret-router.internal/path');
+        expect(env.OPENAI_API_TARGET).toBe('secret-router.internal');
+      });
+
       it('should set OPENAI_API_BASE_PATH in api-proxy when openaiApiBasePath is provided', () => {
         const configWithProxy = { ...mockConfig, enableApiProxy: true, openaiApiKey: 'sk-test-key', openaiApiBasePath: '/serving-endpoints' };
         const result = generateDockerCompose(configWithProxy, mockNetworkConfigWithProxy);
@@ -306,11 +320,19 @@ describe('API proxy sidecar: API targets and auth forwarding', () => {
         expect(env.AWF_GEMINI_ENABLED).toBe('1');
       });
 
-      it('should NOT set AWF_GEMINI_ENABLED in agent when geminiApiKey is absent', () => {
+      it('should NOT set AWF_GEMINI_ENABLED in agent when neither geminiApiKey nor googleApiKey is set', () => {
         const configWithProxy = { ...mockConfig, enableApiProxy: true, openaiApiKey: 'sk-test-key' };
         const result = generateDockerCompose(configWithProxy, mockNetworkConfigWithProxy);
         const env = result.services.agent.environment as Record<string, string>;
         expect(env.AWF_GEMINI_ENABLED).toBeUndefined();
+      });
+
+      it('should set AWF_GEMINI_ENABLED in agent when googleApiKey is provided (Vertex AI)', () => {
+        // Vertex AI uses googleApiKey; ~/.gemini is mounted and entrypoint must fix its ownership.
+        const configWithProxy = { ...mockConfig, enableApiProxy: true, googleApiKey: 'AIza-test-google-key' };
+        const result = generateDockerCompose(configWithProxy, mockNetworkConfigWithProxy);
+        const env = result.services.agent.environment as Record<string, string>;
+        expect(env.AWF_GEMINI_ENABLED).toBe('1');
       });
 
       it('should not inherit AWF_GEMINI_ENABLED from host env via envAll when geminiApiKey is absent', () => {

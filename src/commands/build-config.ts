@@ -1,6 +1,19 @@
 import { WrapperConfig, LogLevel, UpstreamProxyConfig } from '../types';
+import type { AwfFileConfig } from '../config-file';
 import { resolveApiCredentials } from './resolve-credentials';
+import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
 import { logger } from '../logger';
+import {
+  FIRECRACKER_DEFAULT_API_TIMEOUT_MS,
+  FIRECRACKER_DEFAULT_BINARY,
+  FIRECRACKER_DEFAULT_JAILER_BINARY,
+  FIRECRACKER_DEFAULT_MEMORY_MIB,
+  FIRECRACKER_DEFAULT_VCPU_COUNT,
+  CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS,
+  CLOUD_HYPERVISOR_DEFAULT_BINARY,
+  CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB,
+  CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT,
+} from '../types/runtime-options';
 
 /**
  * Resolves the effective `legacySecurity` value from CLI options.
@@ -44,15 +57,18 @@ interface BuildConfigInputs {
   agentCommand: string;
   logLevel: LogLevel;
   allowedDomains: string[];
+  sensitiveAllowedDomains?: string[];
   blockedDomains: string[];
   localhostDetected: boolean;
   additionalEnv: Record<string, string>;
   volumeMounts: string[] | undefined;
   upstreamProxy: UpstreamProxyConfig | undefined;
   dnsServers: string[];
+  dnsServersExplicit?: boolean;
   dnsOverHttps: string | undefined;
   allowedUrls: string[] | undefined;
   memoryLimit: string | undefined;
+  pidsLimit: number | undefined;
   agentImage: string | undefined;
   modelAliases: Record<string, string[]> | undefined;
   allowedModels: string[] | undefined;
@@ -81,15 +97,18 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     agentCommand,
     logLevel,
     allowedDomains,
+    sensitiveAllowedDomains = [],
     blockedDomains,
     localhostDetected,
     additionalEnv,
     volumeMounts,
     upstreamProxy,
     dnsServers,
+    dnsServersExplicit,
     dnsOverHttps,
     allowedUrls,
     memoryLimit,
+    pidsLimit,
     agentImage,
     modelAliases,
     allowedModels,
@@ -109,6 +128,8 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
 
   const chrootIdentity = buildChrootIdentity(options);
   const dind = buildDindConfig(options);
+  const firecracker = buildFirecrackerConfig(options);
+  const cloudHypervisor = buildCloudHypervisorConfig(options);
   const apiCredentials = resolveApiCredentials(options, {
     resolvedCopilotApiTarget,
     resolvedCopilotApiBasePath,
@@ -116,6 +137,7 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
 
   return {
     allowedDomains,
+    sensitiveAllowedDomains: sensitiveAllowedDomains.length > 0 ? sensitiveAllowedDomains : undefined,
     blockedDomains: blockedDomains.length > 0 ? blockedDomains : undefined,
     agentCommand,
     logLevel,
@@ -137,8 +159,10 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     volumeMounts,
     containerWorkDir: options.containerWorkdir as string | undefined,
     dnsServers,
+    dnsServersExplicit,
     dnsOverHttps,
     memoryLimit,
+    pidsLimit,
     proxyLogsDir: options.proxyLogsDir as string | undefined,
     auditDir: (options.auditDir as string | undefined) || process.env.AWF_AUDIT_DIR,
     sessionStateDir:
@@ -166,6 +190,8 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     disallowedModels,
     maxEffectiveTokens,
     maxAiCredits,
+    defaultAiCreditsPricing: options.defaultAiCreditsPricing as WrapperConfig['defaultAiCreditsPricing'],
+    apiProxyProviders: options.apiProxyProviders as WrapperConfig['apiProxyProviders'],
     effectiveTokenModelMultipliers,
     effectiveTokenDefaultModelMultiplier,
     maxModelMultiplierCap,
@@ -205,6 +231,149 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     chrootBinariesSourcePath: options.chrootBinariesSourcePath as string | undefined,
     chrootIdentity,
     dind,
+    firecracker,
+    cloudHypervisor,
+    enclaves: normalizeEnclavesConfig(
+      options.enclaves as AwfFileConfig['enclaves'] | undefined,
+    ),
+  };
+}
+
+function buildFirecrackerConfig(
+  options: Record<string, unknown>,
+): WrapperConfig['firecracker'] {
+  const selected = options.containerRuntime === 'firecracker';
+  const configured = options.firecrackerPreview === true
+    || [
+      'firecrackerBinary',
+      'firecrackerJailerBinary',
+      'firecrackerKernel',
+      'firecrackerRootfs',
+      'firecrackerSupervisor',
+      'firecrackerVcpus',
+      'firecrackerMemoryMib',
+      'firecrackerApiTimeoutMs',
+      'firecrackerBinarySha256',
+      'firecrackerJailerSha256',
+      'firecrackerKernelSha256',
+      'firecrackerRootfsSha256',
+      'firecrackerSupervisorSha256',
+    ].some((key) => options[key] !== undefined);
+  if (!selected && !configured) return undefined;
+
+  const sha256 = {
+    firecracker: options.firecrackerBinarySha256 as string | undefined,
+    jailer: options.firecrackerJailerSha256 as string | undefined,
+    kernel: options.firecrackerKernelSha256 as string | undefined,
+    rootfs: options.firecrackerRootfsSha256 as string | undefined,
+    supervisor: options.firecrackerSupervisorSha256 as string | undefined,
+  };
+
+  return {
+    previewEnabled: options.firecrackerPreview === true,
+    firecrackerBinary:
+      (options.firecrackerBinary as string | undefined) ?? FIRECRACKER_DEFAULT_BINARY,
+    jailerBinary:
+      (options.firecrackerJailerBinary as string | undefined) ??
+      FIRECRACKER_DEFAULT_JAILER_BINARY,
+    kernelPath: options.firecrackerKernel as string | undefined,
+    rootfsPath: options.firecrackerRootfs as string | undefined,
+    supervisorPath: options.firecrackerSupervisor as string | undefined,
+    vcpuCount: parsePositiveIntegerOption(
+      options.firecrackerVcpus,
+      '--firecracker-vcpus',
+      FIRECRACKER_DEFAULT_VCPU_COUNT,
+    ),
+    memoryMib: parsePositiveIntegerOption(
+      options.firecrackerMemoryMib,
+      '--firecracker-memory-mib',
+      FIRECRACKER_DEFAULT_MEMORY_MIB,
+    ),
+    apiTimeoutMs: parsePositiveIntegerOption(
+      options.firecrackerApiTimeoutMs,
+      '--firecracker-api-timeout-ms',
+      FIRECRACKER_DEFAULT_API_TIMEOUT_MS,
+    ),
+    sha256: Object.values(sha256).some((value) => value !== undefined)
+      ? sha256
+      : undefined,
+  };
+}
+
+function parsePositiveIntegerOption(
+  value: unknown,
+  optionName: string,
+  defaultValue: number,
+): number {
+  if (value === undefined) return defaultValue;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${optionName} must be a positive integer`);
+  }
+  return parsed;
+}
+
+/**
+ * Builds the Cloud Hypervisor microVM runtime config (artifacts/digests
+ * plus vcpu/memory/timeout settings). `selected` mirrors the Firecracker
+ * pattern: `--container-runtime cloud-hypervisor` requires explicit
+ * `--cloud-hypervisor-preview` opt-in and full artifact/digest
+ * configuration, enforced by
+ * `assertCloudHypervisorRuntimeCompatibility` in
+ * `src/cloud-hypervisor/runtime-validation.ts`.
+ */
+function buildCloudHypervisorConfig(
+  options: Record<string, unknown>,
+): WrapperConfig['cloudHypervisor'] {
+  const selected = options.containerRuntime === 'cloud-hypervisor';
+  const configured = options.cloudHypervisorPreview === true
+    || [
+      'cloudHypervisorBinary',
+      'cloudHypervisorKernel',
+      'cloudHypervisorRootfs',
+      'cloudHypervisorSupervisor',
+      'cloudHypervisorVcpus',
+      'cloudHypervisorMemoryMib',
+      'cloudHypervisorApiTimeoutMs',
+      'cloudHypervisorBinarySha256',
+      'cloudHypervisorKernelSha256',
+      'cloudHypervisorRootfsSha256',
+      'cloudHypervisorSupervisorSha256',
+    ].some((key) => options[key] !== undefined);
+  if (!selected && !configured) return undefined;
+
+  const sha256 = {
+    cloudHypervisor: options.cloudHypervisorBinarySha256 as string | undefined,
+    kernel: options.cloudHypervisorKernelSha256 as string | undefined,
+    rootfs: options.cloudHypervisorRootfsSha256 as string | undefined,
+    supervisor: options.cloudHypervisorSupervisorSha256 as string | undefined,
+  };
+
+  return {
+    previewEnabled: options.cloudHypervisorPreview === true,
+    cloudHypervisorBinary:
+      (options.cloudHypervisorBinary as string | undefined) ?? CLOUD_HYPERVISOR_DEFAULT_BINARY,
+    kernelPath: options.cloudHypervisorKernel as string | undefined,
+    rootfsPath: options.cloudHypervisorRootfs as string | undefined,
+    supervisorPath: options.cloudHypervisorSupervisor as string | undefined,
+    vcpuCount: parsePositiveIntegerOption(
+      options.cloudHypervisorVcpus,
+      '--cloud-hypervisor-vcpus',
+      CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT,
+    ),
+    memoryMib: parsePositiveIntegerOption(
+      options.cloudHypervisorMemoryMib,
+      '--cloud-hypervisor-memory-mib',
+      CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB,
+    ),
+    apiTimeoutMs: parsePositiveIntegerOption(
+      options.cloudHypervisorApiTimeoutMs,
+      '--cloud-hypervisor-api-timeout-ms',
+      CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS,
+    ),
+    sha256: Object.values(sha256).some((value) => value !== undefined)
+      ? sha256
+      : undefined,
   };
 }
 

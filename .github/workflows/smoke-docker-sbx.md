@@ -18,6 +18,7 @@ name: Smoke Docker Sbx
 engine:
   id: copilot
   version: 1.0.34
+model: claude-sonnet-5
 network:
   allowed:
     - defaults
@@ -45,8 +46,6 @@ sandbox:
     id: awf
     runtime: docker-sbx
     sudo: true
-  mcp:
-    version: v0.3.32
 strict: false
 jobs:
   verify_token_usage:
@@ -57,7 +56,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Download agent artifact
@@ -69,7 +68,6 @@ jobs:
         run: node scripts/ci/check-token-usage.js --artifact-root /tmp/gh-aw-agent --engine copilot
 steps:
   - name: Pre-compute smoke test data
-    id: smoke-data
     run: |
       echo "::group::Fetching last 2 merged PRs"
       PR_DATA=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --limit 2 \
@@ -92,15 +90,12 @@ steps:
       echo "Wrote and read back: $FILE_CONTENT"
       echo "::endgroup::"
 
-      # Export results for agent context
-      {
-        echo "SMOKE_PR_DATA<<SMOKE_EOF"
-        echo "$PR_DATA"
-        echo "SMOKE_EOF"
-        echo "SMOKE_HTTP_CODE=$HTTP_CODE"
-        echo "SMOKE_FILE_CONTENT=$FILE_CONTENT"
-        echo "SMOKE_FILE_PATH=$TEST_FILE"
-      } >> "$GITHUB_OUTPUT"
+      # Write results to files for agent context
+      mkdir -p /tmp/gh-aw/agent
+      echo "$HTTP_CODE" > /tmp/gh-aw/agent/smoke-http-code.txt
+      echo "$FILE_CONTENT" > /tmp/gh-aw/agent/smoke-file-content.txt
+      echo "$TEST_FILE" > /tmp/gh-aw/agent/smoke-file-path.txt
+      echo "$PR_DATA" > /tmp/gh-aw/agent/smoke-pr-data.txt
     env:
       GH_TOKEN: ${{ github.token }}
 post-steps:
@@ -136,27 +131,27 @@ The following tests were already executed in a deterministic pre-agent step. You
 ### 1. GitHub MCP Testing
 Verify MCP connectivity by calling `github-list_pull_requests` for ${{ github.repository }} (limit 2, state merged). Confirm the result matches the pre-fetched data below.
 ### 2. GitHub.com Connectivity
-Pre-step result: HTTP ${{ steps.smoke-data.outputs.SMOKE_HTTP_CODE }} from github.com.
+Pre-step result: HTTP (see `/tmp/gh-aw/agent/smoke-http-code.txt`) from github.com.
 ✅ if HTTP 200 or 301, ❌ otherwise.
 
 ### 3. File Write/Read Test
-Pre-step wrote and read back: "${{ steps.smoke-data.outputs.SMOKE_FILE_CONTENT }}"
-File path: ${{ steps.smoke-data.outputs.SMOKE_FILE_PATH }}
+Pre-step wrote and read back: "(see `/tmp/gh-aw/agent/smoke-file-content.txt`)"
+File path: (see `/tmp/gh-aw/agent/smoke-file-path.txt`)
 Verify by running `cat` on the file path using bash to confirm it exists.
 
 ## Pre-Fetched PR Data
 
-    ${{ steps.smoke-data.outputs.SMOKE_PR_DATA }}
+    (see `/tmp/gh-aw/agent/smoke-pr-data.txt`)
 
 ## Output (MANDATORY)
 
-**If triggered by a pull request** (check: `${{ github.event_name }}` equals "pull_request"), you MUST call `add_comment` to post a **very brief** comment (max 5-10 lines) on the current pull request with:
+**If triggered by a pull request** (check: `${{ github.event_name }}` equals "pull_request"), you MUST call `add_comment` with `item_number: ${{ github.event.pull_request.number }}` to post a **very brief** comment (max 5-10 lines) on the current pull request. Do not rely on implicit triggering context, because Docker sbx may not propagate the event name into the safe-outputs gateway. Include:
 - PR titles only (no descriptions)
 - ✅ or ❌ for each test result
 - Overall status: PASS or FAIL
 - Mention the pull request author and any assignees
 
 If all tests pass on a pull request trigger:
-- Use the `add_labels` safe-output tool to add the label `smoke-docker-sbx` to the pull request
+- Use the `add_labels` safe-output tool with `item_number: ${{ github.event.pull_request.number }}` to add the label `smoke-docker-sbx` to the pull request
 
 **If triggered by workflow_dispatch or schedule** (no PR context), call `noop` with a concise PASS/FAIL summary instead. Do NOT attempt to add pull request comments or labels when there is no pull request.

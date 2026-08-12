@@ -23,6 +23,8 @@ awf --env-file /tmp/runtime-paths.env -e MY_VAR=override 'command'
 
 When using `sudo -E`, these host variables are automatically passed: `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `USER`, `TERM`, `HOME`, `XDG_CONFIG_HOME`.
 
+GitHub Actions supplies `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` when the job grants `id-token: write`. Never print or inspect either value. AWF excludes them from the agent environment. It forwards them directly to the API-proxy sidecar when `AWF_AUTH_TYPE=github-oidc`, and also when `GH_AW_OTLP_WORKLOAD_IDENTITY` is set to enable OIDC workload identity for the OTLP trace exporter (`src/services/api-proxy-env-config.ts`).
+
 The following are always set/overridden: `PATH` (container values).
 
 ### Self-hosted runner home directory support
@@ -44,7 +46,9 @@ Using `--env-all` passes all host environment variables to the container, which 
 3. **Unnecessary Access**: Extra variables increase attack surface (violates least privilege)
 4. **Accidental Sharing**: Easy to forget what's in your environment when sharing commands
 
-**Excluded variables** (even with `--env-all`): `PATH`, `PWD`, `OLDPWD`, `SHLVL`, `_`, `SUDO_*`
+**Excluded variables** (even with `--env-all`): `PATH`, `PWD`, `OLDPWD`, `SHLVL`, `_`, `SUDO_*`, `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RESULTS_URL`, `ACTIONS_ID_TOKEN_REQUEST_URL`, and `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. Actions OIDC variables are forwarded directly to the api-proxy sidecar in `github-oidc` mode, and also when `GH_AW_OTLP_WORKLOAD_IDENTITY` is configured for OTLP exporter workload identity; they are never forwarded to the agent.
+
+`--env-all` is not a safe way to troubleshoot authentication. Do not expose Actions OIDC request variables to the agent to support HTTP MCP `auth.type: github-oidc`: gh-aw launches mcpg separately from a runner-owned step. [github/gh-aw#50053](https://github.com/github/gh-aw/issues/50053), which tracked that boundary and existing-lock compatibility, is resolved by [github/gh-aw#50054](https://github.com/github/gh-aw/pull/50054). The [Auth Doctor Updater workflow](../.github/workflows/auth-doctor-updater.md) audits this guidance without running credential probes.
 
 **Proxy variables:** `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, and `FTP_PROXY` (all case variants) from the host are **excluded from container passthrough** when using `--env-all`. The firewall sets its own proxy variables pointing to Squid inside the container. However, host proxy variables **are read** for upstream proxy auto-detection — if the host has `https_proxy`/`http_proxy` set, AWF configures Squid to chain outbound traffic through that corporate proxy (see [Upstream Proxy Support](#upstream-corporate-proxy-support)).
 
@@ -64,7 +68,7 @@ Using `--env-all` passes all host environment variables to the container, which 
 3. `--env-file` variables
 4. `--env` / `-e` explicit variables (highest priority)
 
-**Excluded variables** in `--env-file` (same list as `--env-all`): `PATH`, `PWD`, `HOME`, `SUDO_*`, etc.
+**Excluded variables** in `--env-file` (same list as `--env-all`): `PATH`, `PWD`, `HOME`, `SUDO_*`, Actions runtime credentials, etc. Explicit `--env` cannot override credential exclusions.
 
 **Example use case — Safe Outputs MCP:**
 ```bash
@@ -421,6 +425,35 @@ awf --upstream-proxy http://proxy.corp.com:3128 --allow-domains github.com 'curl
 Host proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`,
 `ALL_PROXY`, `NO_PROXY`, etc.) are **always excluded** from container passthrough, even with
 `--env-all`. AWF sets its own proxy variables pointing to Squid (`172.30.0.10:3128`).
+
+## Resource Limits
+
+The agent container has two configurable resource ceilings:
+
+- **Memory** (`--memory-limit`, default `6g`): Docker `mem_limit`. See `docs/usage.md`.
+- **Process/thread count** (`--pids-limit`, default `1000`): Docker `pids_limit`, the maximum
+  number of processes/threads the container (and everything running inside it) may create.
+
+Concurrent JVM-heavy builds (e.g. `javac`, Android's manifest merger) can spin up many
+threads and hit the default 1000-process ceiling, failing with errors like
+`unable to create native thread` or `Cannot create worker GC thread` that look like
+application bugs rather than a sandbox limit. If you see these errors, raise the ceiling:
+
+```bash
+awf --pids-limit 4000 --allow-domains github.com 'command'
+```
+
+or via the config file:
+
+```yaml
+container:
+  pidsLimit: 4000
+```
+
+`--pids-limit` is a Docker Compose agent setting. It is unsupported by microVM
+runtimes such as `--container-runtime sbx`: AWF warns and ignores it because
+the sandbox does not support passing through the Docker agent cgroup or its
+`pids.max`/`pids.current` metrics.
 
 ## Troubleshooting
 

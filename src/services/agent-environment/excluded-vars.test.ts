@@ -1,6 +1,10 @@
 import { buildExclusionSet } from './excluded-vars';
 import { PROXY_ENV_VARS } from '../../upstream-proxy';
 import { WrapperConfig } from '../../types';
+import {
+  ENCLAVE_AGENT_EXECUTOR_DEFAULTS,
+  ENCLAVE_SCRIPT_EXECUTOR_DEFAULTS,
+} from '../../types/enclave-options';
 
 // Minimal WrapperConfig for tests
 function makeConfig(overrides: Partial<WrapperConfig> = {}): WrapperConfig {
@@ -15,6 +19,19 @@ describe('buildExclusionSet', () => {
     it('should always exclude PATH', () => {
       const set = buildExclusionSet(makeConfig());
       expect(set.has('PATH')).toBe(true);
+    });
+
+    it('never passes enclave gateway handoff material to the primary agent', () => {
+      const excluded = buildExclusionSet(makeConfig({ envAll: true }));
+      for (const name of [
+        'AWF_ENCLAVE_MCP_CAPABILITY',
+        'AWF_ENCLAVE_MCP_GATEWAY_IDENTITY',
+        'AWF_ENCLAVE_MCP_GATEWAY_ENDPOINT',
+        'AWF_ENCLAVE_MCP_GATEWAY_CONTAINER',
+        'AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS',
+      ]) {
+        expect(excluded.has(name)).toBe(true);
+      }
     });
 
     it('should always exclude shell state variables', () => {
@@ -74,6 +91,10 @@ describe('buildExclusionSet', () => {
       expect(buildExclusionSet(config).has('ANTHROPIC_API_KEY')).toBe(true);
     });
 
+    it('should exclude ANTHROPIC_AUTH_TOKEN', () => {
+      expect(buildExclusionSet(config).has('ANTHROPIC_AUTH_TOKEN')).toBe(true);
+    });
+
     it('should exclude CLAUDE_API_KEY', () => {
       expect(buildExclusionSet(config).has('CLAUDE_API_KEY')).toBe(true);
     });
@@ -117,6 +138,10 @@ describe('buildExclusionSet', () => {
     it('should exclude GITHUB_PERSONAL_ACCESS_TOKEN (credential isolation)', () => {
       expect(buildExclusionSet(config).has('GITHUB_PERSONAL_ACCESS_TOKEN')).toBe(true);
     });
+
+    it('should exclude OPENAI_ENDPOINT_OVERRIDE (sidecar endpoint isolation)', () => {
+      expect(buildExclusionSet(config).has('OPENAI_ENDPOINT_OVERRIDE')).toBe(true);
+    });
   });
 
   describe('when enableApiProxy is false', () => {
@@ -128,6 +153,10 @@ describe('buildExclusionSet', () => {
 
     it('should NOT exclude ANTHROPIC_API_KEY', () => {
       expect(buildExclusionSet(config).has('ANTHROPIC_API_KEY')).toBe(false);
+    });
+
+    it('should NOT exclude ANTHROPIC_AUTH_TOKEN', () => {
+      expect(buildExclusionSet(config).has('ANTHROPIC_AUTH_TOKEN')).toBe(false);
     });
 
     it('should NOT exclude COPILOT_GITHUB_TOKEN', () => {
@@ -148,6 +177,10 @@ describe('buildExclusionSet', () => {
 
     it('should NOT exclude GITHUB_PERSONAL_ACCESS_TOKEN', () => {
       expect(buildExclusionSet(config).has('GITHUB_PERSONAL_ACCESS_TOKEN')).toBe(false);
+    });
+
+    it('should NOT exclude OPENAI_ENDPOINT_OVERRIDE', () => {
+      expect(buildExclusionSet(config).has('OPENAI_ENDPOINT_OVERRIDE')).toBe(false);
     });
   });
 
@@ -183,6 +216,53 @@ describe('buildExclusionSet', () => {
     });
   });
 
+  describe('when enclaves are enabled (repository credential isolation)', () => {
+    const enclaves = {
+      enabled: true,
+      privateRepos: [{ repo: 'octo/private', sensitivity: 'internal' as const }],
+      executors: {
+        script: { ...ENCLAVE_SCRIPT_EXECUTOR_DEFAULTS, enabled: true },
+        agent: ENCLAVE_AGENT_EXECUTOR_DEFAULTS,
+      },
+    };
+
+    it.each([
+      'GITHUB_TOKEN',
+      'GH_TOKEN',
+      'GITHUB_PERSONAL_ACCESS_TOKEN',
+      'COPILOT_GITHUB_TOKEN',
+      'GITHUB_API_TOKEN',
+      'GITHUB_PAT',
+      'GH_ACCESS_TOKEN',
+    ])(
+      'should exclude %s even without the API or DIFC proxies',
+      (name) => {
+        const config = makeConfig({ enclaves, enableApiProxy: false, difcProxyHost: undefined });
+        expect(buildExclusionSet(config).has(name)).toBe(true);
+      },
+    );
+
+    it.each([
+      'GITHUB_TOKEN',
+      'GH_TOKEN',
+      'GITHUB_PERSONAL_ACCESS_TOKEN',
+      'COPILOT_GITHUB_TOKEN',
+      'GITHUB_API_TOKEN',
+      'GITHUB_PAT',
+      'GH_ACCESS_TOKEN',
+    ])(
+      'should NOT exclude %s when enclaves are configured but disabled',
+      (name) => {
+        const config = makeConfig({
+          enclaves: { ...enclaves, enabled: false },
+          enableApiProxy: false,
+          difcProxyHost: undefined,
+        });
+        expect(buildExclusionSet(config).has(name)).toBe(false);
+      },
+    );
+  });
+
   describe('when excludeEnv is set', () => {
     it('should exclude all custom env vars', () => {
       const config = makeConfig({ excludeEnv: ['MY_SECRET', 'ANOTHER_VAR'] });
@@ -215,6 +295,7 @@ describe('buildExclusionSet', () => {
       });
       const set = buildExclusionSet(config);
       expect(set.has('ANTHROPIC_API_KEY')).toBe(true);
+      expect(set.has('ANTHROPIC_AUTH_TOKEN')).toBe(true);
       expect(set.has('GITHUB_TOKEN')).toBe(true);
       expect(set.has('CUSTOM_SECRET')).toBe(true);
       expect(set.has('PATH')).toBe(true);

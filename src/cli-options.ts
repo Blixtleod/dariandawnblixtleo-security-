@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { version } from '../package.json';
 import { collectRulesetFile, collectStringArray, formatItem } from './option-parsers';
+import { CLOUD_HYPERVISOR_RELEASE_VERSION } from './types/runtime-options';
 
 // Option group markers used by the custom help formatter to insert section headers.
 // Each key is the long flag name of the first option in a group.
@@ -10,6 +11,8 @@ const optionGroupHeaders: Record<string, string> = {
   'config': 'Configuration:',
   'allow-domains': 'Domain Filtering:',
   'build-local': 'Image Management:',
+  'firecracker-preview': 'Firecracker Preview:',
+  'cloud-hypervisor-preview': 'Cloud Hypervisor Preview (GitHub-hosted Ubuntu x86_64 KVM only):',
   'env': 'Container Configuration:',
   'dns-servers': 'Network & Security:',
   'upstream-proxy': 'Network & Security:',
@@ -174,8 +177,54 @@ program
    'Container runtime for the agent container.\n' +
    '                                       "gvisor" — OCI runtime via Docker Compose (translates to runsc).\n' +
    '                                       "sbx" — Docker sbx microVM with hypervisor isolation.\n' +
+   '                                       "firecracker" — explicit Linux/KVM Firecracker v1.16.1 preview.\n' +
+   '                                       "cloud-hypervisor" — explicit GitHub-hosted Ubuntu x86_64 KVM\n' +
+   '                                       Cloud Hypervisor v53.0 preview.\n' +
    '                                       Unknown values are passed through as raw Docker runtime names.'
   )
+  .option(
+   '--firecracker-preview',
+   'Enable the Firecracker v1.16.1 workload-execution preview.\n' +
+   '                                       Requires Linux/KVM, local Docker, jailer, and pinned guest artifacts.',
+   false
+  )
+  .option('--firecracker-binary <path>', 'Path to the Firecracker v1.16.1 binary.')
+  .option('--firecracker-jailer-binary <path>', 'Path to the matching Firecracker v1.16.1 jailer binary.')
+  .option('--firecracker-kernel <path>', 'Path to the guest Linux kernel image.')
+  .option('--firecracker-rootfs <path>', 'Path to the guest root filesystem image.')
+  .option('--firecracker-supervisor <path>', 'Path to the built AWF Firecracker guest supervisor.')
+  .option('--firecracker-vcpus <count>', 'Guest virtual CPU count (default: 2).')
+  .option('--firecracker-memory-mib <mib>', 'Guest memory in MiB (default: 512).')
+  .option('--firecracker-api-timeout-ms <ms>', 'Bounded API socket readiness timeout in milliseconds (default: 5000).')
+  .option('--firecracker-binary-sha256 <digest>', 'Expected SHA-256 digest of the Firecracker binary.')
+  .option('--firecracker-jailer-sha256 <digest>', 'Expected SHA-256 digest of the jailer binary.')
+  .option('--firecracker-kernel-sha256 <digest>', 'Expected SHA-256 digest of the guest kernel.')
+  .option('--firecracker-rootfs-sha256 <digest>', 'Expected SHA-256 digest of the guest rootfs.')
+  .option('--firecracker-supervisor-sha256 <digest>', 'Expected SHA-256 digest of the AWF guest supervisor.')
+
+  // -- Cloud Hypervisor Preview --
+  //
+  // NOTE: like Firecracker, this requires explicit --cloud-hypervisor-preview
+  // opt-in plus --container-runtime cloud-hypervisor and is supported only
+  // on GitHub-hosted Ubuntu x86_64 KVM runners (self-hosted is unsupported).
+  .option(
+   '--cloud-hypervisor-preview',
+   `Enable the Cloud Hypervisor v${CLOUD_HYPERVISOR_RELEASE_VERSION} workload-execution preview.\n` +
+   '                                       GitHub-hosted Ubuntu x86_64 KVM runners only. Requires local Docker\n' +
+   '                                       and pinned guest artifacts.',
+   false
+  )
+  .option('--cloud-hypervisor-binary <path>', `Path to the Cloud Hypervisor v${CLOUD_HYPERVISOR_RELEASE_VERSION} binary.`)
+  .option('--cloud-hypervisor-kernel <path>', 'Path to the PCI-capable guest Linux kernel image.')
+  .option('--cloud-hypervisor-rootfs <path>', 'Path to the guest root filesystem image.')
+  .option('--cloud-hypervisor-supervisor <path>', 'Path to the built AWF guest supervisor (shared with Firecracker).')
+  .option('--cloud-hypervisor-vcpus <count>', 'Guest virtual CPU count (default: 2).')
+  .option('--cloud-hypervisor-memory-mib <mib>', 'Guest memory in MiB (default: 512).')
+  .option('--cloud-hypervisor-api-timeout-ms <ms>', 'Bounded API socket readiness timeout in milliseconds (default: 5000).')
+  .option('--cloud-hypervisor-binary-sha256 <digest>', 'Expected SHA-256 digest of the Cloud Hypervisor binary.')
+  .option('--cloud-hypervisor-kernel-sha256 <digest>', 'Expected SHA-256 digest of the guest kernel.')
+  .option('--cloud-hypervisor-rootfs-sha256 <digest>', 'Expected SHA-256 digest of the guest rootfs.')
+  .option('--cloud-hypervisor-supervisor-sha256 <digest>', 'Expected SHA-256 digest of the AWF guest supervisor.')
 
   // -- Container Configuration --
   .option(
@@ -213,6 +262,11 @@ program
     '--memory-limit <limit>',
     'Memory limit for the agent container (e.g., 4g, 6g, 8g, 512m). Default: 6g',
     '6g'
+  )
+  .option(
+    '--pids-limit <limit>',
+    'Process/thread ceiling for the agent container (e.g., 1000, 2000). Default: 1000',
+    '1000'
   )
   .option(
     '--tty',
@@ -470,6 +524,11 @@ program
     'Collect container logs, exit state, and sanitized config on non-zero exit.\n' +
     '                                       Useful for debugging container startup failures (e.g. Squid crashes in DinD).\n' +
     '                                       Written to <workDir>/diagnostics/ (or <audit-dir>/diagnostics/ when set).',
+    false
+  )
+  .option(
+    '--reflect',
+    'Start AWF, query the API proxy /reflect endpoint, and print its JSON response',
     false
   )
   .argument('[args...]', 'Command and arguments to execute (use -- to separate from options)');

@@ -36,6 +36,7 @@ export function mapAwfFileConfigToCliOptions(config: AwfFileConfig): Record<stri
     maxEffectiveTokens: config.apiProxy?.maxEffectiveTokens,
     maxAiCredits: config.apiProxy?.maxAiCredits,
     defaultAiCreditsPricing: config.apiProxy?.defaultAiCreditsPricing,
+    apiProxyProviders: config.apiProxy?.providers,
     effectiveTokenModelMultipliers: config.apiProxy?.modelMultipliers,
     effectiveTokenDefaultModelMultiplier: config.apiProxy?.defaultModelMultiplier,
     maxModelMultiplierCap: config.apiProxy?.maxModelMultiplierCap,
@@ -97,6 +98,7 @@ export function mapAwfFileConfigToCliOptions(config: AwfFileConfig): Record<stri
     difcProxyCaCert: config.security?.difcProxy?.caCert,
 
     memoryLimit: config.container?.memoryLimit,
+    pidsLimit: toStringIfDefined(config.container?.pidsLimit),
     agentTimeout: toStringIfDefined(config.container?.agentTimeout),
     enableDind: config.container?.enableDind,
     workDir: config.container?.workDir,
@@ -112,6 +114,32 @@ export function mapAwfFileConfigToCliOptions(config: AwfFileConfig): Record<stri
     containerRuntime: config.container?.containerRuntime,
     runnerToolCachePath: config.container?.runnerToolCachePath,
     mount: config.container?.mounts,
+    firecrackerPreview: config.firecracker?.previewEnabled,
+    firecrackerBinary: config.firecracker?.firecrackerBinary,
+    firecrackerJailerBinary: config.firecracker?.jailerBinary,
+    firecrackerKernel: config.firecracker?.kernelPath,
+    firecrackerRootfs: config.firecracker?.rootfsPath,
+    firecrackerSupervisor: config.firecracker?.supervisorPath,
+    firecrackerVcpus: config.firecracker?.vcpuCount,
+    firecrackerMemoryMib: config.firecracker?.memoryMib,
+    firecrackerApiTimeoutMs: config.firecracker?.apiTimeoutMs,
+    firecrackerBinarySha256: config.firecracker?.sha256?.firecracker,
+    firecrackerJailerSha256: config.firecracker?.sha256?.jailer,
+    firecrackerKernelSha256: config.firecracker?.sha256?.kernel,
+    firecrackerRootfsSha256: config.firecracker?.sha256?.rootfs,
+    firecrackerSupervisorSha256: config.firecracker?.sha256?.supervisor,
+    cloudHypervisorPreview: config.cloudHypervisor?.previewEnabled,
+    cloudHypervisorBinary: config.cloudHypervisor?.cloudHypervisorBinary,
+    cloudHypervisorKernel: config.cloudHypervisor?.kernelPath,
+    cloudHypervisorRootfs: config.cloudHypervisor?.rootfsPath,
+    cloudHypervisorSupervisor: config.cloudHypervisor?.supervisorPath,
+    cloudHypervisorVcpus: config.cloudHypervisor?.vcpuCount,
+    cloudHypervisorMemoryMib: config.cloudHypervisor?.memoryMib,
+    cloudHypervisorApiTimeoutMs: config.cloudHypervisor?.apiTimeoutMs,
+    cloudHypervisorBinarySha256: config.cloudHypervisor?.sha256?.cloudHypervisor,
+    cloudHypervisorKernelSha256: config.cloudHypervisor?.sha256?.kernel,
+    cloudHypervisorRootfsSha256: config.cloudHypervisor?.sha256?.rootfs,
+    cloudHypervisorSupervisorSha256: config.cloudHypervisor?.sha256?.supervisor,
     chrootBinariesSourcePath: config.chroot?.binariesSourcePath,
     chrootIdentityHome: config.chroot?.identity?.home,
     chrootIdentityUser: config.chroot?.identity?.user,
@@ -143,5 +171,9 @@ export function mapAwfFileConfigToCliOptions(config: AwfFileConfig): Record<stri
 
     runnerTopology: config.runner?.topology,
     sysrootImage: config.runner?.sysrootImage,
+
+    // Unified enclaves remain config-only; executor controls are trusted AWF
+    // configuration and are never projected onto invocation arguments.
+    enclaves: config.enclaves,
   };
 }

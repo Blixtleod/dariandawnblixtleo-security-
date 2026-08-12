@@ -73,7 +73,7 @@ The firewall uses a containerized architecture with Squid proxy for L7 (HTTP/HTT
 ## Container Architecture
 
 ### Squid Container (`containers/squid/`)
-- Based on `ubuntu/squid:latest`
+- Based on `alpine:3.24` with Squid installed from Alpine packages
 - Mounts dynamically-generated `squid.conf` from work directory
 - Exposes port 3128 for proxy traffic
 - Logs to shared volume `squid-logs:/var/log/squid`
@@ -94,6 +94,17 @@ The firewall uses a containerized architecture with Squid proxy for L7 (HTTP/HTT
   - Allow DNS queries
   - Allow traffic to Squid proxy itself
   - Redirect all HTTP (port 80) and HTTPS (port 443) to Squid via DNAT (NAT table)
+
+### gVisor Startup Crash Recovery
+
+When the firewall is running with gVisor runtime, it implements automatic recovery for transient startup crashes:
+
+- **Retryable Exit Codes:** Exit codes 134 (abort) and 139 (segmentation fault) are treated as startup crashes
+- **Startup Window:** Only eligible exits from containers whose measured runtime is less than 30 seconds are retried; runtime is used as a heuristic for an initialization crash and does not prove that user code has not started
+- **Retry Limit:** The container will be restarted once (maximum 1 retry attempt per command execution)
+- **Implementation:** Located in `src/container-lifecycle.ts`
+
+This recovery mechanism retries likely transient initialization failures. If a retry occurs, the command's final exit code is taken from the restarted attempt.
 
 ## Traffic Flow
 
@@ -127,6 +138,11 @@ The wrapper generates:
 1. **Squid proxy starts first** with healthcheck
 2. **Agent container waits** for Squid to be healthy
 3. **iptables rules applied** in agent container to redirect all HTTP/HTTPS traffic
+4. **gVisor Startup Crash Recovery** (when using gVisor runtime):
+   - If the agent container exits during startup with crash codes (134, 139), the firewall will retry once
+   - Only retries if the container crashed within 30 seconds (before any agent work began)
+   - Prevents transient crashes during V8/Node.js initialization from failing the entire workflow
+   - Exit codes 134 (abort) and 139 (segfault) are considered retryable startup crashes
 
 ### 3. Traffic Routing
 - All HTTP (port 80) and HTTPS (port 443) traffic → Squid proxy
@@ -223,3 +239,28 @@ Use `--keep-containers` to preserve containers and files after execution for deb
 - `execa`: Subprocess execution (docker-compose commands)
 - `js-yaml`: YAML generation for Docker Compose config
 - TypeScript 5.x, compiled to ES2020 CommonJS
+
+## Firecracker microVM runtime (preview)
+
+When `--container-runtime firecracker --firecracker-preview` is supplied, AWF
+uses a substantially different execution architecture:
+
+- The **agent container is replaced** by a Firecracker microVM — a hardware-isolated
+  virtual machine with its own Linux kernel.
+- The Squid proxy and API proxy **remain as Docker Compose containers** on the host.
+- The workspace is **not bind-mounted**; it is copied into a bounded ext4 image
+  (`workspace.ext4`) before boot and copied back after the agent exits.
+  There is no live filesystem passthrough (no virtiofs).
+- A **dedicated network namespace** (`awffc-<runId>`) isolates the VM's network.
+  nftables rules inside the namespace allow only Squid and the API proxy; all
+  other guest outbound connections are denied.
+- The **API proxy is mandatory**; provider credentials are never passed as guest
+  environment variables and an explicit assertion enforces this.
+- **TTY, Docker-in-Docker, topology peers, enclaves, extra volume mounts, and
+  remote Docker hosts all fail closed** in this preview.
+- **Linux/KVM only** — macOS and Windows are permanently unsupported.
+  CI specifically supports GitHub-hosted x64 `ubuntu-24.04`; KVM remains
+  mandatory, and hosts without usable `/dev/kvm` access fail closed.
+
+See [Firecracker integration (preview)](./firecracker-integration.md) for the
+full architecture, trust model, and operator guide.

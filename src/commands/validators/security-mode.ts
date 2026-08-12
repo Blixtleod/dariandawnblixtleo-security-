@@ -30,11 +30,19 @@ export function applySecurityMode(config: WrapperConfig): void {
 
   // --- strict security (default) ---
 
-  // MicroVM runtimes (e.g. sbx) enforce isolation at the hypervisor layer via
-  // DOCKER_SANDBOXES_PROXY; Docker network topology does not apply to them.
+  // Docker sbx enforces isolation through its hypervisor proxy and does not use
+  // Docker topology. Firecracker is also a microVM, but explicitly attaches its
+  // host-side veth to AWF's proven internal bridge, so topology remains required.
   const isMicroVmRuntime = !runtimeUsesComposeAgent(config.containerRuntime);
 
-  if (!isMicroVmRuntime) {
+  if (isMicroVmRuntime && config.pidsLimit !== undefined) {
+    logger.warn(
+      '⚠️  --pids-limit/container.pidsLimit is not supported by this microVM runtime and will be ignored.\n' +
+      '   The Docker agent cgroup cannot be passed through, so pids.max/pids.current are unavailable.',
+    );
+  }
+
+  if (!isMicroVmRuntime || config.containerRuntime === 'firecracker') {
     // Force network-isolation on.
     // Only warn when explicitly disabled (=== false); undefined means "not set by user".
     if (!config.networkIsolation) {
@@ -51,8 +59,23 @@ export function applySecurityMode(config: WrapperConfig): void {
   // Force api-proxy on (always, regardless of flags).
   config.enableApiProxy = true;
 
-  // Override incompatible options
-  if (config.enableHostAccess) {
+  // Override host access options that depend on host-level iptables.
+  //
+  // In network-isolation (topology) mode, the agent is on an internal Docker
+  // network with no direct host route, so no iptables-based host access is
+  // configured.  Instead, trusted services are reached via topology peers
+  // (--topology-attach) attached to awf-net.  --enable-host-access in that
+  // mode drives Squid port ACLs and the hosts-file entry for
+  // host.docker.internal — both of which are compatible with strict security.
+  //
+  // NOTE: at this point in the pipeline, networkIsolation has already been
+  // forced to true above (for non-microVM runtimes), so
+  // !config.networkIsolation is false for standard Docker-compose runs.
+  //
+  // For microVM runtimes, networkIsolation does not imply topology routing
+  // support (the compose agent is not used), so host access remains
+  // incompatible and is still suppressed in strict mode.
+  if (config.enableHostAccess && (isMicroVmRuntime || !config.networkIsolation)) {
     logger.warn(
       '⚠️  --enable-host-access was ignored (incompatible with strict security, the default).\n' +
       '   Pass --legacy-security to enable host access.',
@@ -74,7 +97,11 @@ export function applySecurityMode(config: WrapperConfig): void {
   }
 
   // Similarly, allowHostServicePorts alone (without enableHostAccess) would
-  // auto-enable host access downstream — suppress it in strict mode.
+  // auto-enable host access downstream via iptables — suppress it in strict
+  // mode.  This applies even in network-isolation mode because
+  // allowHostServicePorts is specifically for GitHub Actions services
+  // containers accessed through host-gateway iptables rules, not topology
+  // peers.
   if (config.allowHostServicePorts) {
     logger.warn(
       '⚠️  --allow-host-service-ports was ignored (incompatible with strict security, the default).\n' +

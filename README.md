@@ -33,6 +33,9 @@ sudo awf --allow-domains github.com -- curl https://api.github.com
 
 The `--` separator divides firewall options from the command to run.
 
+To inspect the API proxy endpoints and models without running an agent command,
+use `awf --reflect`. It prints the `/reflect` JSON response to stdout.
+
 ## Feature highlights
 
 - **Declarative config support**: `--config <path>` with JSON/YAML + published JSON Schema
@@ -71,6 +74,7 @@ See [GitHub Actions](docs/github_actions.md) for advanced setup and `awf logs su
 - [Usage guide](docs/usage.md) — CLI flags, domain allowlists, examples
 - [AWF config schema](docs/awf-config.schema.json) — machine-readable JSON Schema for JSON/YAML configs (also published as a [versioned release asset](https://github.com/github/gh-aw-firewall/releases/latest/download/awf-config.schema.json) for IDE autocomplete)
 - [AWF config spec](docs/awf-config-spec.md) — normative processing and precedence rules for tooling/compiler integration
+- [Unified enclave architecture](docs/enclaves-architecture.md) — AWF-owned enclave MCP server, mcpg-only access, and the `enclave_run_script` / `enclave_run_agent` tools for private-repository execution
 - [Audit log schema](schemas/audit.schema.json) — JSON Schema for L7 traffic audit records (`audit.jsonl`)
 - [Token usage schema](schemas/token-usage.schema.json) — JSON Schema for per-call token usage records (`token-usage.jsonl`)
 - [Schemas README](schemas/README.md) — versioning policy, record identification, and validation examples
@@ -78,6 +82,7 @@ See [GitHub Actions](docs/github_actions.md) for advanced setup and `awf logs su
 - [Chroot mode](docs/chroot-mode.md) — use host binaries with network isolation (glibc-based daemon hosts)
 - [API proxy sidecar](docs/api-proxy-sidecar.md) — secure credential management for LLM APIs
 - [Authentication architecture](docs/authentication-architecture.md) — deep dive into token handling and credential isolation
+- [Authentication matrix](docs/auth-matrix.md) — supported static, BYOK, and OIDC provider combinations
 - [SSL Bump](docs/ssl-bump.md) — HTTPS content inspection for URL path filtering
 - [GitHub Actions](docs/github_actions.md) — CI/CD integration and MCP server setup
 - [Environment variables](docs/environment.md) — passing environment variables to containers
@@ -87,7 +92,10 @@ See [GitHub Actions](docs/github_actions.md) for advanced setup and `awf logs su
 - [Compatibility](docs/compatibility.md) — supported Node.js, OS, and Docker versions
 - [Troubleshooting](docs/troubleshooting.md) — common issues and fixes
 - [Diagnosing AWF failures](docs/diagnosing-awf-failures.md) — use the Self-Hosted Runner Doctor agent to triage self-hosted/ARC/GHES/GHEC failures
+- [Auth Doctor Updater workflow](.github/workflows/auth-doctor-updater.md) — daily/manual audit that opens bounded PRs with evidence-backed authentication and API-proxy documentation corrections
 - [Image verification](docs/image-verification.md) — cosign signature verification
+- [Firecracker integration (preview)](docs/firecracker-integration.md) — Firecracker v1.16.1 microVM backend: explicit opt-in, Linux/KVM only, macOS/Windows unsupported, operator-managed artifacts with mandatory SHA-256 digests, fail-closed egress, mandatory API proxy credential isolation
+- [Cloud Hypervisor integration (preview)](docs/cloud-hypervisor-foundation.md) — Cloud Hypervisor v53.0 microVM backend: explicit opt-in, GitHub-hosted Ubuntu x86_64 KVM runners only, operator-managed artifacts with mandatory SHA-256 digests, Landlock/seccomp-confined launcher in place of a jailer, fail-closed egress, mandatory API proxy credential isolation
 
 ## Development
 

@@ -18,10 +18,9 @@
  *      non-default OCI runtime but is still orchestrated by `docker compose`.
  *    - `microvm` – agent runs in a hypervisor-isolated microVM (e.g. Docker
  *      sbx).  Infrastructure services (Squid, api-proxy) stay in Docker Compose
- *      on the host; only the agent crosses the hypervisor boundary.  The sbx
- *      proxy chains upstream through AWF's host-side Squid for domain filtering,
- *      and through the api-proxy for token logging/model routing/credential
- *      injection.
+ *      on the host; only the agent crosses the hypervisor boundary.  A selected
+ *      external runtime backend owns the agent lifecycle and connects it to
+ *      AWF's host-side infrastructure.
  *
  * ## Adding a new OCI runtime
  *
@@ -32,11 +31,11 @@
  *
  * ## Adding a microVM backend (e.g. Docker sbx)
  *
- * Add an entry with `executionModel: 'microvm'`.  Callers use
- * {@link runtimeUsesComposeAgent} to decide whether to include the agent
- * service in docker-compose.yml and whether to use `docker logs/wait` or
- * the microVM CLI for agent lifecycle management.  Infrastructure services
- * (Squid, api-proxy) are generated regardless of execution model.
+ * Add an entry with `executionModel: 'microvm'` and register its backend in
+ * `external-runtime-backend-resolver.ts`. Callers use
+ * {@link runtimeUsesComposeAgent} to distinguish Compose-managed agents from
+ * external backends and to decide whether to include the agent service in
+ * docker-compose.yml. Infrastructure services are generated in either mode.
  */
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -74,6 +73,21 @@ interface RuntimeCapabilities {
    * @see https://github.com/google/gvisor/issues/7469
    */
   readonly needsStaticDns: boolean;
+
+  /**
+   * When `true`, AWF sets up egress control via the `awf-iptables-init` container,
+   * which applies host-netns iptables DNAT/RETURN rules inside the agent's network
+   * namespace (redirect port 80/443 → Squid, and bypass Squid for the MCP gateway).
+   *
+   * When `false`, those rules cannot govern the agent's traffic — e.g. gVisor's
+   * userspace netstack is isolated from the host network namespace, so the
+   * iptables-init container is skipped entirely and egress relies solely on the
+   * `HTTP_PROXY`/`HTTPS_PROXY` env vars plus `NO_PROXY` (the MCP gateway is reached
+   * directly instead of via an iptables bypass).
+   *
+   * @see https://github.com/google/gvisor/issues/7469
+   */
+  readonly usesIptables: boolean;
 }
 
 /**
@@ -86,14 +100,56 @@ const RUNTIME_REGISTRY: Readonly<Record<string, RuntimeCapabilities>> = {
     executionModel: 'compose',
     dockerRuntime: 'runsc',
     needsStaticDns: true,
+    // gVisor's isolated netstack can't be governed by host-netns iptables rules,
+    // so skip the iptables-init container and route egress via proxy env vars.
+    usesIptables: false,
   },
-  // Future: Docker sbx microVM backend
   sbx: {
     executionModel: 'microvm',
     dockerRuntime: undefined,
     needsStaticDns: false,   // sbx manages its own DNS
+    usesIptables: false,     // microVM manages its own network egress
+  },
+  firecracker: {
+    executionModel: 'microvm',
+    dockerRuntime: undefined,
+    needsStaticDns: false,
+    usesIptables: false,
+  },
+  'cloud-hypervisor': {
+    executionModel: 'microvm',
+    dockerRuntime: undefined,
+    needsStaticDns: false,
+    usesIptables: false,
   },
 };
+
+/**
+ * Aliases for runtime names that should resolve to the same capabilities as a
+ * canonical registry entry.  This lets users pass either the friendly name
+ * (`gvisor`) or the raw Docker OCI runtime name (`runsc`) and get identical
+ * behavior — without an alias, `runsc` would fall through to the unknown-runtime
+ * defaults (iptables-capable), reintroducing the gVisor egress bug.
+ */
+const RUNTIME_ALIASES: Readonly<Record<string, string>> = {
+  runsc: 'gvisor',
+};
+
+/**
+ * Canonicalizes a user-facing runtime name to its registry key, following the
+ * alias table.  Unknown names are returned unchanged.
+ */
+function canonicalRuntime(runtime: string): string {
+  return RUNTIME_ALIASES[runtime] ?? runtime;
+}
+
+/**
+ * Looks up the capabilities for a runtime name, following aliases.  Returns
+ * `undefined` for unknown names (raw Docker runtime identifiers / default runc).
+ */
+function lookupCapabilities(runtime: string): RuntimeCapabilities | undefined {
+  return RUNTIME_REGISTRY[canonicalRuntime(runtime)];
+}
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -105,7 +161,7 @@ const RUNTIME_REGISTRY: Readonly<Record<string, RuntimeCapabilities>> = {
  * runtime field.
  */
 export function resolveDockerRuntime(runtime: string): string | undefined {
-  const entry = RUNTIME_REGISTRY[runtime];
+  const entry = lookupCapabilities(runtime);
   if (entry) return entry.dockerRuntime;
   // Unknown name — pass through as a raw Docker runtime identifier
   return runtime;
@@ -121,7 +177,24 @@ export function resolveDockerRuntime(runtime: string): string | undefined {
  */
 export function runtimeNeedsStaticDns(runtime: string | undefined): boolean {
   if (!runtime) return false;
-  return RUNTIME_REGISTRY[runtime]?.needsStaticDns ?? false;
+  return lookupCapabilities(runtime)?.needsStaticDns ?? false;
+}
+
+/**
+ * Returns `true` when AWF should set up egress control for the runtime via the
+ * `awf-iptables-init` container (host-netns iptables DNAT/RETURN rules).
+ *
+ * Returns `false` for runtimes whose network stack cannot be governed by those
+ * rules (e.g. gVisor's isolated netstack, or microVM backends that manage their
+ * own egress).  For these, AWF skips the iptables-init container and relies on
+ * proxy env vars + `NO_PROXY`.
+ *
+ * Defaults to `true` for unknown/undefined runtimes (raw Docker runtime names
+ * and the default runc), which share the host network namespace.
+ */
+export function runtimeUsesIptables(runtime: string | undefined): boolean {
+  if (!runtime) return true;
+  return lookupCapabilities(runtime)?.usesIptables ?? true;
 }
 
 /**
@@ -136,7 +209,18 @@ export function runtimeNeedsStaticDns(runtime: string | undefined): boolean {
  */
 export function runtimeUsesComposeAgent(runtime: string | undefined): boolean {
   if (!runtime) return true;
-  const entry = RUNTIME_REGISTRY[runtime];
+  const entry = lookupCapabilities(runtime);
   if (!entry) return true; // unknown runtime → assume compose
   return entry.executionModel === 'compose';
+}
+
+/**
+ * Returns `true` when the configured runtime is gVisor, accepting either the
+ * friendly name (`gvisor`) or the raw Docker OCI runtime name (`runsc`).  Use
+ * this instead of a direct `=== 'gvisor'` comparison so both spellings are
+ * handled consistently.
+ */
+export function isGvisorRuntime(runtime: string | undefined): boolean {
+  if (!runtime) return false;
+  return canonicalRuntime(runtime) === 'gvisor';
 }

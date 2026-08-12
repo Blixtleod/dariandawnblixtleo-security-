@@ -7,6 +7,39 @@ import { logger } from './logger';
 import { applyHostPathPrefixToVolumes } from './services/host-path-prefix';
 import { getLocalDockerEnv } from './docker-host';
 
+export function isBenignArtifactPermissionError(error: unknown): boolean {
+  const details: string[] = [];
+  if (typeof error === 'string') {
+    details.push(error);
+  } else if (error && typeof error === 'object') {
+    const errorLike = error as {
+      stderr?: unknown;
+      stdout?: unknown;
+      shortMessage?: unknown;
+      message?: unknown;
+      code?: unknown;
+    };
+    for (const value of [
+      errorLike.stderr,
+      errorLike.stdout,
+      errorLike.shortMessage,
+      errorLike.message,
+      errorLike.code,
+    ]) {
+      if (typeof value === 'string') {
+        details.push(value);
+      }
+    }
+  }
+
+  const combinedDetails = details.join('\n');
+  return (
+    /(?:^|\n)(?:chown|chmod):.*(?:operation not permitted|permission denied|\bEPERM\b|\bEACCES\b)/i.test(
+      combinedDetails,
+    ) || /(?:^|\n)\s*(?:EPERM|EACCES)\s*(?:\n|$)/i.test(combinedDetails)
+  );
+}
+
 function resolvePermFixerImageRef(imageRegistry?: string, imageTag?: string, agentImage?: string): string {
   try {
     const registry = imageRegistry || 'ghcr.io/github/gh-aw-firewall';
@@ -64,6 +97,8 @@ export function fixArtifactPermissionsForRootless(
           'DAC_OVERRIDE',
           '--cap-add',
           'FOWNER',
+          '--entrypoint',
+          'sh',
           '-e',
           `TUID=${uid}`,
           '-e',
@@ -71,7 +106,6 @@ export function fixArtifactPermissionsForRootless(
           '-v',
           mount,
           imageRef,
-          'sh',
           '-c',
           'chown -R "$TUID:$TGID" /fix 2>/dev/null; chmod -R a+rwX /fix',
         ],
@@ -80,10 +114,24 @@ export function fixArtifactPermissionsForRootless(
 
       if (typeof result.exitCode === 'number' && result.exitCode !== 0) {
         const stderr = result.stderr?.trim();
-        logger.warn(
-          `Rootless artifact permission repair failed for ${dir} (exit ${result.exitCode})` +
-            (stderr ? `: ${stderr}` : ''),
-        );
+        const stdout = result.stdout?.trim();
+        const errorDetail = stderr || stdout;
+        // Ownership/permission repair is best-effort: the agent has already
+        // finished and its artifacts are still readable by the owning user.
+        // On rootless or restricted runners (e.g. ARC/DinD with a non-root
+        // runner container) the repair container may be denied CHOWN/chmod,
+        // producing "Operation not permitted" / "Permission denied". Those are
+        // expected and non-fatal, so log them at debug to avoid alarming users
+        // who otherwise see a scary WARN for a benign, non-blocking condition.
+        const detail = `for ${dir} (exit ${result.exitCode})` + (errorDetail ? `: ${errorDetail}` : '');
+        if (isBenignArtifactPermissionError(errorDetail)) {
+          logger.debug(
+            `Rootless artifact permission repair skipped ${detail}. ` +
+              `This is expected on restricted runners and does not affect the run.`,
+          );
+        } else {
+          logger.warn(`Rootless artifact permission repair failed ${detail}`);
+        }
       }
     } catch (error) {
       logger.warn(`Rootless artifact permission repair failed for ${dir}:`, error);
